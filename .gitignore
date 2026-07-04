@@ -1,0 +1,11 @@
+node_modules/
+dist/
+*.log
+
+# スパイク検証の生成物・スクラッチ
+poc/
+spike_shot.png
+poc/*.err
+poc/*.out
+__pycache__/
+.DS_Store
