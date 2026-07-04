@@ -112,8 +112,9 @@ export async function loadStep(bytes: Uint8Array, name: string): Promise<ModelMe
     evictOthers(id)
     return metaOf(cached)
   }
-  // これから新規ロードするので、既存モデルは全て破棄してメモリを空ける
-  evictOthers(id)
+  // 注意: eviction は「新モデルのパース成功後」に行う（下部）。パース前に消すと、
+  // 壊れた STEP で読込失敗した際に表示中の旧モデルまで _models から消え、
+  // 画面に残った旧ジオメトリへのピック/計測が unknown model id で死ぬ。
 
   // emscripten 仮想FSへ書き込み → STEP読込。
   //
@@ -184,6 +185,9 @@ export async function loadStep(bytes: Uint8Array, name: string): Promise<ModelMe
   // メッシュを即構築してキャッシュ（三角形/頂点数を meta に載せるため）
   model.meshPack = buildMeshPack(oc, model)
   _models.set(id, model)
+  // パース成功が確定してから旧モデルを破棄する（読込失敗時に表示中モデルを
+  // 巻き込まないため）。瞬間的に旧+新が同居するが、正しさをメモリ最小化より優先。
+  evictOthers(id)
 
   return metaOf(model)
 }
@@ -357,20 +361,26 @@ export async function distance(id: string, a: EntityRef, b: EntityRef): Promise<
   if (!model) throw new Error(`unknown model id: ${id}`)
   const sa = resolveShape(oc, model, a)
   const sb = resolveShape(oc, model, b)
+  // BRepExtrema wrapper は WASM ヒープ上の embind オブジェクト。GC されないので
+  // 数値を JS 側へ写し取った後、必ず delete して解放する（計測は繰り返される）。
   const ext = new oc.BRepExtrema_DistShapeShape_2(
     sa,
     sb,
     oc.Extrema_ExtFlag.Extrema_ExtFlag_MIN,
     oc.Extrema_ExtAlgo.Extrema_ExtAlgo_Grad,
   )
-  if (!ext.IsDone() || ext.NbSolution() < 1) throw new Error('距離計算に失敗')
-  const pa = ext.PointOnShape1(1)
-  const pb = ext.PointOnShape2(1)
-  return {
-    type: 'distance',
-    value: ext.Value(),
-    pointA: [pa.X(), pa.Y(), pa.Z()],
-    pointB: [pb.X(), pb.Y(), pb.Z()],
+  try {
+    if (!ext.IsDone() || ext.NbSolution() < 1) throw new Error('距離計算に失敗')
+    const pa = ext.PointOnShape1(1)
+    const pb = ext.PointOnShape2(1)
+    return {
+      type: 'distance',
+      value: ext.Value(),
+      pointA: [pa.X(), pa.Y(), pa.Z()],
+      pointB: [pb.X(), pb.Y(), pb.Z()],
+    }
+  } finally {
+    ext.delete?.()
   }
 }
 
@@ -381,28 +391,34 @@ export async function faceInfo(id: string, ref: EntityRef): Promise<FaceInfoResu
   if (!model) throw new Error(`unknown model id: ${id}`)
   const face = oc.TopoDS.Face_1(resolveShape(oc, model, ref))
 
+  // props / surf は embind オブジェクト。数値を写し取ったら delete して解放する。
   const props = new oc.GProp_GProps_1()
-  oc.BRepGProp.SurfaceProperties_1(face, props, false, false)
-  const out: FaceInfoResult = { type: 'face', area: props.Mass(), surface: 'unknown' }
-
   const surf = new oc.BRepAdaptor_Surface_2(face, true)
-  const stype = surf.GetType().value // 列挙は singleton だが value 比較で確実に
-  if (stype === oc.GeomAbs_SurfaceType.GeomAbs_Cylinder.value) {
-    const cyl = surf.Cylinder()
-    const c = cyl.Location()
-    const ax = cyl.Axis().Direction()
-    out.surface = 'cylinder'
-    out.radius = cyl.Radius()
-    out.diameter = 2 * cyl.Radius()
-    out.center = [c.X(), c.Y(), c.Z()]
-    out.axis = [ax.X(), ax.Y(), ax.Z()]
-  } else if (stype === oc.GeomAbs_SurfaceType.GeomAbs_Plane.value) {
-    const pln = surf.Plane()
-    const n = pln.Axis().Direction()
-    out.surface = 'plane'
-    out.normal = [n.X(), n.Y(), n.Z()]
+  try {
+    oc.BRepGProp.SurfaceProperties_1(face, props, false, false)
+    const out: FaceInfoResult = { type: 'face', area: props.Mass(), surface: 'unknown' }
+
+    const stype = surf.GetType().value // 列挙は singleton だが value 比較で確実に
+    if (stype === oc.GeomAbs_SurfaceType.GeomAbs_Cylinder.value) {
+      const cyl = surf.Cylinder()
+      const c = cyl.Location()
+      const ax = cyl.Axis().Direction()
+      out.surface = 'cylinder'
+      out.radius = cyl.Radius()
+      out.diameter = 2 * cyl.Radius()
+      out.center = [c.X(), c.Y(), c.Z()]
+      out.axis = [ax.X(), ax.Y(), ax.Z()]
+    } else if (stype === oc.GeomAbs_SurfaceType.GeomAbs_Plane.value) {
+      const pln = surf.Plane()
+      const n = pln.Axis().Direction()
+      out.surface = 'plane'
+      out.normal = [n.X(), n.Y(), n.Z()]
+    }
+    return out
+  } finally {
+    props.delete?.()
+    surf.delete?.()
   }
-  return out
 }
 
 /** エッジ情報: スパイクでは picking がエッジを返さないため未使用。契約維持のため実装。 */
