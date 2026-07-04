@@ -426,6 +426,16 @@ testHooks.__cadProject = (x: number, y: number, z: number) => {
 }
 testHooks.__cadStallMeasure = (ms: number) => __stallNextMeasure(ms)
 testHooks.__cadStallSidecar = (ms: number) => __stallNextSidecar(ms)
+// spike検証用: 2つの面ID間の真値距離を直接測る（ピクセルピック非依存の計測実証）
+testHooks.__cadFaceDistance = async (idA: number, idB: number) => {
+  if (!currentModelId) return null
+  const { measureDistance } = await import('./api')
+  return measureDistance(
+    currentModelId,
+    { partId: 0, kind: 'face', id: idA },
+    { partId: 0, kind: 'face', id: idB },
+  )
+}
 testHooks.__cadPick = (clientX: number, clientY: number) => {
   const rect = viewer.renderer.domElement.getBoundingClientRect()
   const ndc = new THREE.Vector2(
