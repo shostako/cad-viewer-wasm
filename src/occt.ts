@@ -50,11 +50,49 @@ interface LoadedModel {
 }
 
 const _models = new Map<string, LoadedModel>()
-let _idSeq = 0
 
 function extToRoute(name: string): 'brep' | 'unsupported' {
   const ext = name.toLowerCase().split('.').pop() ?? ''
   return ext === 'step' || ext === 'stp' ? 'brep' : 'unsupported'
+}
+
+/** ファイル内容の SHA-256 先頭16バイトを hex で返す（モデルID＝サイドカーキーの安定化）。 */
+async function contentHash(bytes: Uint8Array): Promise<string> {
+  // subtle.digest は元バッファのビューでなく独立コピーを要求するので slice で渡す
+  const digest = await crypto.subtle.digest('SHA-256', bytes.slice().buffer)
+  const arr = new Uint8Array(digest).subarray(0, 16)
+  return Array.from(arr, (b) => b.toString(16).padStart(2, '0')).join('')
+}
+
+function metaOf(model: LoadedModel): ModelMeta {
+  return {
+    id: model.id,
+    name: model.name,
+    format: 'brep',
+    vertexCount: model.vertexCount,
+    triangleCount: model.triangleCount,
+    partCount: 1,
+    bbox: model.bbox,
+  }
+}
+
+/** 現在ロード中以外の全モデルを破棄し WASM/JS メモリを解放する（OCCTヒープ枯渇の防止）。 */
+function evictOthers(keepId: string): void {
+  for (const [id, m] of _models) {
+    if (id === keepId) continue
+    disposeModel(m)
+    _models.delete(id)
+  }
+}
+
+function disposeModel(m: LoadedModel): void {
+  // embind オブジェクトは GC されない。明示 delete で WASM ヒープを返す。
+  try {
+    m.shape?.delete?.()
+    for (const f of m.faces) f?.delete?.()
+  } catch {
+    /* 破棄失敗は致命ではない */
+  }
 }
 
 /** STEP バイト列を読み、shape と面配列を格納して ModelMeta を返す。 */
@@ -63,6 +101,19 @@ export async function loadStep(bytes: Uint8Array, name: string): Promise<ModelMe
   if (extToRoute(name) !== 'brep') {
     throw new Error(`スパイクは STEP のみ対応（.step/.stp）: ${name}`)
   }
+
+  // モデルID＝ファイル内容ハッシュ。アップロード順ではなくファイルに紐付くので
+  // サイドカー(localStorage)キーが安定し、同一ファイル再アップロードで
+  // 保存済み計測を取り違えない（backend の content_hash と同趣旨）。
+  const id = `m${await contentHash(bytes)}`
+  // 同一内容が既にロード済みなら再パースせず再利用（backend のハッシュ dedup 相当）
+  const cached = _models.get(id)
+  if (cached) {
+    evictOthers(id)
+    return metaOf(cached)
+  }
+  // これから新規ロードするので、既存モデルは全て破棄してメモリを空ける
+  evictOthers(id)
 
   // emscripten 仮想FSへ書き込み → STEP読込。
   //
@@ -120,7 +171,6 @@ export async function loadStep(bytes: Uint8Array, name: string): Promise<ModelMe
     faces.push(oc.TopoDS.Face_1(exp.Current()))
   }
 
-  const id = `m${_idSeq++}`
   const model: LoadedModel = {
     id,
     name,
@@ -135,15 +185,7 @@ export async function loadStep(bytes: Uint8Array, name: string): Promise<ModelMe
   model.meshPack = buildMeshPack(oc, model)
   _models.set(id, model)
 
-  return {
-    id,
-    name,
-    format: 'brep',
-    vertexCount: model.vertexCount,
-    triangleCount: model.triangleCount,
-    partCount: 1,
-    bbox,
-  }
+  return metaOf(model)
 }
 
 function computeBBox(oc: OC, shape: OC): { min: number[]; max: number[] } {
