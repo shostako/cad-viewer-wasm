@@ -1,4 +1,15 @@
-import { parseMeshPack, type MeshPack } from './meshpack'
+/**
+ * cad-viewer-wasm のデータ層。
+ *
+ * 元 cad-viewer では fetch で WSL の FastAPI backend を叩いていた。ここでは
+ * 同じシグネチャのまま中身をブラウザ内の OCCT-WASM エンジン(occt.ts)へ委譲する。
+ * この api.ts だけが唯一の継ぎ目(seam)で、main/viewer/picking/measure は
+ * データ源が Python サーバか WASM かを知らずに動く。
+ *
+ * サイドカー(計測の永続化)は localStorage に置く（backend もサーバも不要）。
+ */
+import type { MeshPack } from './meshpack'
+import { loadStep, meshPackOf, distance, faceInfo, edgeInfo } from './occt'
 
 export interface ModelMeta {
   id: string
@@ -9,32 +20,22 @@ export interface ModelMeta {
   partCount: number
   cached?: boolean
   bbox: { min: number[]; max: number[] }
-  // drawing (2D) payloads
   bbox2d?: { min: [number, number]; max: [number, number] }
   snapPoints?: { dxf: [number, number]; svg: [number, number]; kind: string }[]
 }
 
-export async function fetchDrawingSvg(modelId: string): Promise<string> {
-  const res = await fetch(`/api/models/${modelId}/drawing.svg`)
-  if (!res.ok) throw new Error(`svg fetch failed: ${res.status}`)
-  return res.text()
+export async function fetchDrawingSvg(_modelId: string): Promise<string> {
+  // 2D図面(DXF)はWASM移植の後段。スパイクでは未対応。
+  throw new Error('2D図面はこのビルドでは未対応')
 }
 
 export async function uploadModel(file: File): Promise<ModelMeta> {
-  const form = new FormData()
-  form.append('file', file)
-  const res = await fetch('/api/models', { method: 'POST', body: form })
-  if (!res.ok) {
-    const detail = await res.json().catch(() => ({ detail: res.statusText }))
-    throw new Error(detail.detail ?? `upload failed: ${res.status}`)
-  }
-  return res.json()
+  const bytes = new Uint8Array(await file.arrayBuffer())
+  return loadStep(bytes, file.name)
 }
 
 export async function fetchMesh(modelId: string): Promise<MeshPack> {
-  const res = await fetch(`/api/models/${modelId}/mesh.bin`)
-  if (!res.ok) throw new Error(`mesh fetch failed: ${res.status}`)
-  return parseMeshPack(await res.arrayBuffer())
+  return meshPackOf(modelId)
 }
 
 export interface EntityRef {
@@ -72,21 +73,7 @@ export interface FaceInfoResult {
   normal?: [number, number, number]
 }
 
-async function measureRequest<T>(modelId: string, body: unknown): Promise<T> {
-  const res = await fetch(`/api/models/${modelId}/measure`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  })
-  if (!res.ok) {
-    const detail = await res.json().catch(() => ({ detail: res.statusText }))
-    throw new Error(detail.detail ?? `measure failed: ${res.status}`)
-  }
-  return res.json()
-}
-
-// test-only: lets an E2E hold the NEXT distance request in flight, to exercise
-// measure-mode cancellation while a request is pending (one-shot, self-clearing)
+// test-only: hold the NEXT distance request in flight (measure-mode cancel test)
 let _stallNextMeasureMs = 0
 export function __stallNextMeasure(ms: number): void {
   _stallNextMeasureMs = ms
@@ -98,41 +85,37 @@ export async function measureDistance(modelId: string, a: EntityRef, b: EntityRe
     _stallNextMeasureMs = 0
     await new Promise((r) => setTimeout(r, ms))
   }
-  return measureRequest<DistanceResult>(modelId, { type: 'distance', a, b })
+  return distance(modelId, a, b)
 }
 
 export function measureEdgeInfo(modelId: string, ref: EntityRef) {
-  return measureRequest<EdgeInfoResult>(modelId, { type: 'edge_info', ref })
+  return edgeInfo(modelId, ref)
 }
 
 export function measureFaceInfo(modelId: string, ref: EntityRef) {
-  return measureRequest<FaceInfoResult>(modelId, { type: 'face_info', ref })
+  return faceInfo(modelId, ref)
 }
 
-/** Per-vertex thickness per part (0 = no data). method: ray=fast, ball=rolling ball (exact at junctions) */
+/** 肉厚: WASM移植の後段（three-mesh-bvh でレイ法を移す予定）。スパイクでは未対応。 */
 export async function fetchThickness(
-  modelId: string,
-  method: 'ray' | 'ball' = 'ray',
+  _modelId: string,
+  _method: 'ray' | 'ball' = 'ray',
 ): Promise<Map<number, Float32Array>> {
-  const res = await fetch(`/api/models/${modelId}/thickness.bin?method=${method}`)
-  if (!res.ok) throw new Error(`thickness fetch failed: ${res.status}`)
-  const pack = parseMeshPack(await res.arrayBuffer())
-  const out = new Map<number, Float32Array>()
-  for (const [name, arr] of Object.entries(pack.buffers)) {
-    const m = name.match(/^p(\d+):thickness$/)
-    if (m) out.set(Number(m[1]), arr as Float32Array)
-  }
-  return out
+  throw new Error('肉厚チェックはこのビルドでは未対応')
 }
+
+// --- サイドカー永続化: localStorage ---------------------------------------
+const SIDECAR_PREFIX = 'cad-viewer-wasm:sidecar:'
 
 export async function getSidecar(modelId: string): Promise<Record<string, unknown>> {
-  const res = await fetch(`/api/models/${modelId}/sidecar`)
-  if (!res.ok) return {}
-  return res.json()
+  try {
+    const raw = localStorage.getItem(SIDECAR_PREFIX + modelId)
+    return raw ? (JSON.parse(raw) as Record<string, unknown>) : {}
+  } catch {
+    return {}
+  }
 }
 
-// test-only: lets an E2E hold the NEXT sidecar PUT in flight, to exercise a
-// teardown flush racing a debounce-timer save (one-shot, self-clearing)
 let _stallNextSidecarMs = 0
 export function __stallNextSidecar(ms: number): void {
   _stallNextSidecarMs = ms
@@ -144,9 +127,9 @@ export async function putSidecar(modelId: string, body: unknown): Promise<void> 
     _stallNextSidecarMs = 0
     await new Promise((r) => setTimeout(r, ms))
   }
-  await fetch(`/api/models/${modelId}/sidecar`, {
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  })
+  try {
+    localStorage.setItem(SIDECAR_PREFIX + modelId, JSON.stringify(body))
+  } catch {
+    /* best-effort */
+  }
 }
