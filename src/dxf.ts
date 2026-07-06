@@ -88,45 +88,67 @@ type FlatEntity =
   | { type: 'point'; p: [number, number] }
   | { type: 'ellipsePoly'; pts: [number, number][] } // 非一様スケールで円/弧が楕円になる場合の近似
 
+// Codexレビュー指摘(P2、実測で確認・修正): 旧実装は変換を{dx,dy,rotDeg,sx,sy}
+// (回転角+軸ごとスケール)に「都度分解・再構成」しており、鏡映(sx<0等)を
+// 経由した合成で「回転にすでに折り込まれた反転」と「符号付きsxの反転」を
+// 二重適用してしまうケースがあった（回転から反転を判別できないのに、
+// 入力側の符号だけから反転を復元しようとしたのが原因）。
+// 分解・再構成を一切行わない標準的な2x3アフィン行列（線形部 a,b,c,d +
+// 平行移動 dx,dy、x'=a*x+c*y+dx, y'=b*x+d*y+dy）に置き換えることで、
+// 合成は単純な行列積になり曖昧さが原理的に生じない。
 interface Xform {
-  // v' = R * S * v + T （回転はdeg、スケールは軸ごと、その後平行移動）
+  a: number
+  b: number
+  c: number
+  d: number
   dx: number
   dy: number
-  rotDeg: number
-  sx: number
-  sy: number
 }
 
-const IDENTITY: Xform = { dx: 0, dy: 0, rotDeg: 0, sx: 1, sy: 1 }
+const IDENTITY: Xform = { a: 1, b: 0, c: 0, d: 1, dx: 0, dy: 0 }
 
 function applyXform(x: Xform, p: [number, number]): [number, number] {
-  const rad = (x.rotDeg * Math.PI) / 180
+  return [x.a * p[0] + x.c * p[1] + x.dx, x.b * p[0] + x.d * p[1] + x.dy]
+}
+
+function xformFromRotScale(dx: number, dy: number, rotDeg: number, sx: number, sy: number): Xform {
+  const rad = (rotDeg * Math.PI) / 180
   const cos = Math.cos(rad)
   const sin = Math.sin(rad)
-  const sx = p[0] * x.sx
-  const sy = p[1] * x.sy
-  return [sx * cos - sy * sin + x.dx, sx * sin + sy * cos + x.dy]
+  // v' = R(rot) * diag(sx,sy) * v + T
+  return { a: cos * sx, b: sin * sx, c: -sin * sy, d: cos * sy, dx, dy }
 }
 
-/** 2つの変換の合成（内側→外側の順で適用、insertの入れ子で使う）。 */
+/** 2つの変換の合成（内側→外側の順で適用、insertの入れ子で使う）。標準的な
+ * 行列積そのもので、分解・再構成を経由しないため反転の二重適用が起きない。 */
 function composeXform(outer: Xform, inner: Xform): Xform {
-  // outer(inner(v)) を単一Xformで表す。非一様スケール+回転の合成は一般には
-  // 単純な{dx,dy,rotDeg,sx,sy}で厳密には表現できない（せん断が生じ得る）が、
-  // 実務のDXF（ネストしたINSERTの回転+一様スケールが大半）では十分な近似。
-  // 一様スケール(sx===sy)同士の合成は厳密。
-  const origin = applyXform(outer, applyXform(inner, [0, 0]))
-  const ex = applyXform(outer, applyXform(inner, [1, 0]))
-  const ey = applyXform(outer, applyXform(inner, [0, 1]))
-  const dx = origin[0]
-  const dy = origin[1]
-  const sx = Math.hypot(ex[0] - dx, ex[1] - dy)
-  const sy = Math.hypot(ey[0] - dx, ey[1] - dy)
-  const rotDeg = (Math.atan2(ex[1] - dy, ex[0] - dx) * 180) / Math.PI
-  return { dx, dy, rotDeg, sx: sx * Math.sign(inner.sx * outer.sx) || sx, sy: sy * Math.sign(inner.sy * outer.sy) || sy }
+  return {
+    a: outer.a * inner.a + outer.c * inner.b,
+    b: outer.b * inner.a + outer.d * inner.b,
+    c: outer.a * inner.c + outer.c * inner.d,
+    d: outer.b * inner.c + outer.d * inner.d,
+    dx: outer.a * inner.dx + outer.c * inner.dy + outer.dx,
+    dy: outer.b * inner.dx + outer.d * inner.dy + outer.dy,
+  }
 }
 
+/** 線形部が「回転+一様スケール(+鏡映)」か（せん断や非一様スケールが無いか）。
+ * 列ベクトル(a,b)と(c,d)が直交し長さが等しいことで判定する。 */
 function isUniform(x: Xform): boolean {
-  return Math.abs(Math.abs(x.sx) - Math.abs(x.sy)) < 1e-9
+  const len1 = Math.hypot(x.a, x.b)
+  const len2 = Math.hypot(x.c, x.d)
+  const dot = x.a * x.c + x.b * x.d
+  return Math.abs(len1 - len2) < 1e-9 * Math.max(len1, len2, 1) && Math.abs(dot) < 1e-9 * Math.max(len1 * len2, 1)
+}
+
+/** 一様スケール成分の大きさ（|det|の平方根 = 回転+鏡映を除いた拡大率）。 */
+function uniformScale(x: Xform): number {
+  return Math.sqrt(Math.abs(x.a * x.d - x.b * x.c))
+}
+
+/** 鏡映（向き反転）を含むか（行列式が負）。 */
+function isMirrored(x: Xform): boolean {
+  return x.a * x.d - x.b * x.c < 0
 }
 
 const SEGMENTS_PER_CIRCLE = 64
@@ -140,6 +162,19 @@ function sampleEllipse(c: [number, number], r: number, x: Xform, startDeg: numbe
     const a = ((startDeg + (sweep * i) / n) * Math.PI) / 180
     const local: [number, number] = [c[0] + r * Math.cos(a), c[1] + r * Math.sin(a)]
     pts.push(applyXform(x, local))
+  }
+  return pts
+}
+
+/** 局所座標系での円弧（符号付き掃引角）を密な点列にサンプリングする
+ * （変換前に呼び、結果を1点ずつapplyXformする使い方を想定）。 */
+function sampleArcLocalPoints(c: [number, number], r: number, startDeg: number, sweepDeg: number): [number, number][] {
+  const pts: [number, number][] = []
+  const n = Math.max(4, Math.round((SEGMENTS_PER_CIRCLE * Math.abs(sweepDeg)) / 360))
+  for (let i = 0; i <= n; i++) {
+    const deg = startDeg + (sweepDeg * i) / n
+    const rad = (deg * Math.PI) / 180
+    pts.push([c[0] + r * Math.cos(rad), c[1] + r * Math.sin(rad)])
   }
   return pts
 }
@@ -167,7 +202,7 @@ function flattenOne(e: IEntity, blocks: Record<string, IBlock>, x: Xform, depth:
     case 'CIRCLE': {
       const ce = e as ICircleEntity
       if (isUniform(x)) {
-        out.push({ type: 'circle', c: applyXform(x, [ce.center.x, ce.center.y]), r: ce.radius * Math.abs(x.sx) })
+        out.push({ type: 'circle', c: applyXform(x, [ce.center.x, ce.center.y]), r: ce.radius * uniformScale(x) })
       } else {
         out.push({ type: 'ellipsePoly', pts: sampleEllipse([ce.center.x, ce.center.y], ce.radius, x, 0, 360) })
       }
@@ -202,11 +237,11 @@ function flattenOne(e: IEntity, blocks: Record<string, IBlock>, x: Xform, depth:
         const cWorld = applyXform(x, [ae.center.x, ae.center.y])
         const pStartWorld = applyXform(x, pStart0)
         const startDeg = (Math.atan2(pStartWorld[1] - cWorld[1], pStartWorld[0] - cWorld[0]) * 180) / Math.PI
-        const flip = x.sx * x.sy < 0
+        const flip = isMirrored(x)
         out.push({
           type: 'arc',
           c: cWorld,
-          r: ae.radius * Math.abs(x.sx),
+          r: ae.radius * uniformScale(x),
           startDeg,
           sweepDeg: flip ? -nativeSweepDeg : nativeSweepDeg,
         })
@@ -215,18 +250,45 @@ function flattenOne(e: IEntity, blocks: Record<string, IBlock>, x: Xform, depth:
       }
       return
     }
-    case 'LWPOLYLINE': {
-      const pe = e as ILwpolylineEntity
-      const pts = pe.vertices.map((v): [number, number] => applyXform(x, [v.x, v.y]))
-      const bulges = pe.vertices.map((v) => v.bulge || 0)
-      out.push({ type: 'polyline', pts, bulges, closed: !!pe.shape })
-      return
-    }
+    case 'LWPOLYLINE':
     case 'POLYLINE': {
-      const pe = e as IPolylineEntity
-      const pts = pe.vertices.map((v): [number, number] => applyXform(x, [v.x, v.y]))
-      const bulges = pe.vertices.map((v) => v.bulge || 0)
-      out.push({ type: 'polyline', pts, bulges, closed: !!pe.shape })
+      const pe = e as ILwpolylineEntity | IPolylineEntity
+      const vertices: { x: number; y: number; bulge?: number }[] = pe.vertices
+      const localPts: [number, number][] = vertices.map((v): [number, number] => [v.x, v.y])
+      const localBulges: number[] = vertices.map((v) => v.bulge || 0)
+      const closed = !!pe.shape
+      if (localBulges.some((b) => b !== 0) && !isUniform(x)) {
+        // Codexレビュー指摘(P2): bulgeは局所座標系での円弧を表すため、
+        // 非一様スケール(xScale!==yScale)のINSERT配下では変換後は楕円になる。
+        // 頂点だけ変換してbulge値をそのまま残すと、変換後の2点から再構成した
+        // 別の円弧になってしまう（CIRCLE/ARCがellipsePolyで対処しているのと
+        // 同じ問題）。局所座標系でセグメントごとに直線/円弧を密にサンプリング
+        // してから点ごとに変換することで対処する。
+        const segs = polySegments(localPts, localBulges, closed)
+        const worldPts: [number, number][] = []
+        for (const seg of segs) {
+          const arc = bulgeArc(seg.a, seg.b, seg.bulge)
+          if (!arc) {
+            worldPts.push(applyXform(x, seg.a))
+          } else {
+            const sampled = sampleArcLocalPoints(arc.c, arc.r, arc.startDeg, arc.sweepDeg)
+            for (const p of sampled.slice(0, -1)) worldPts.push(applyXform(x, p))
+          }
+        }
+        if (!closed) {
+          const last = segs[segs.length - 1]
+          worldPts.push(applyXform(x, last.b))
+        }
+        out.push({ type: 'polyline', pts: worldPts, bulges: worldPts.map(() => 0), closed })
+      } else {
+        const pts = localPts.map((p): [number, number] => applyXform(x, p))
+        // 鏡映(isMirrored)は局所座標系でのCCW/CWの意味を反転させるため、
+        // bulgeの符号も反転する必要がある（ARCエンティティの向き反転と同じ理由、
+        // 対処しないと鏡映ブロック内の丸め角が逆側に膨らむ）。
+        const flip = isMirrored(x)
+        const bulges = flip ? localBulges.map((b) => -b) : localBulges
+        out.push({ type: 'polyline', pts, bulges, closed })
+      }
       return
     }
     case 'POINT': {
@@ -242,14 +304,10 @@ function flattenOne(e: IEntity, blocks: Record<string, IBlock>, x: Xform, depth:
       const bx = block.position ? block.position.x : 0
       const by = block.position ? block.position.y : 0
       // ブロック定義自体の基点(position)を原点に戻してから配置変換をかける
-      const local: Xform = { dx: -bx, dy: -by, rotDeg: 0, sx: 1, sy: 1 }
-      const placement: Xform = {
-        dx: ie.position.x,
-        dy: ie.position.y,
-        rotDeg: ie.rotation || 0,
-        sx: ie.xScale ?? 1,
-        sy: ie.yScale ?? 1,
-      }
+      const local: Xform = { ...IDENTITY, dx: -bx, dy: -by }
+      // ie.rotationは度（INSERTのDXFグループコード50は度、ARCのラジアンとは
+      // 単位が異なることを実測で確認済み — 単位を思い込まず個別に検証した）。
+      const placement: Xform = xformFromRotScale(ie.position.x, ie.position.y, ie.rotation || 0, ie.xScale ?? 1, ie.yScale ?? 1)
       const inner = composeXform(placement, local)
       const combined = composeXform(x, inner)
       const cols = Math.max(1, ie.columnCount || 1)
@@ -258,7 +316,7 @@ function flattenOne(e: IEntity, blocks: Record<string, IBlock>, x: Xform, depth:
       const rowSp = ie.rowSpacing || 0
       for (let row = 0; row < rows; row++) {
         for (let col = 0; col < cols; col++) {
-          const arrayOffset: Xform = { dx: col * colSp, dy: row * rowSp, rotDeg: 0, sx: 1, sy: 1 }
+          const arrayOffset: Xform = { ...IDENTITY, dx: col * colSp, dy: row * rowSp }
           const withArray = composeXform(combined, arrayOffset)
           flattenEntities(block.entities ?? [], blocks, withArray, depth + 1, out)
         }
@@ -474,10 +532,11 @@ function buildSvg(flat: FlatEntity[], bb: { min: [number, number]; max: [number,
 
 function collectSnaps(flat: FlatEntity[], bb: { min: [number, number]; max: [number, number] }): SnapPointOut[] {
   const out: SnapPointOut[] = []
-  const toSvg = (p: [number, number]): [number, number] => [
-    Math.round((p[0] - bb.min[0]) * 10) / 10,
-    Math.round((bb.max[1] - p[1]) * 10) / 10,
-  ]
+  // Codexレビュー指摘(P2): 0.1単位への丸めはdrawing2d.tsのnearestSnapが実際の
+  // クリック位置(svg単位)と比較する精度を損ない、モデル単位が小さい図面や
+  // ズームインした状態でスナップに乗らなくなる。描画ジオメトリと同じ精度
+  // （丸めなし）で保持する。
+  const toSvg = (p: [number, number]): [number, number] => [p[0] - bb.min[0], bb.max[1] - p[1]]
   const add = (p: [number, number], kind: string) => {
     if (out.length < MAX_SNAP_POINTS) {
       out.push({ dxf: [Math.round(p[0] * 1e6) / 1e6, Math.round(p[1] * 1e6) / 1e6], svg: toSvg(p), kind })
