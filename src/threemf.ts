@@ -83,6 +83,16 @@ function applyMat(x: number, y: number, z: number, m: Mat4 | null): [number, num
   ]
 }
 
+/** 平行移動を除いた線形部(左上3x3)の行列式。負なら鏡映変換（ミラー）。 */
+function determinant3x3(m: Mat4 | null): number {
+  if (!m) return 1
+  return (
+    m[0] * (m[5] * m[10] - m[6] * m[9]) -
+    m[1] * (m[4] * m[10] - m[6] * m[8]) +
+    m[2] * (m[4] * m[9] - m[5] * m[8])
+  )
+}
+
 // --- 3MF XML パース -----------------------------------------------------
 
 interface ObjectDef {
@@ -177,8 +187,13 @@ export async function load3mf(bytes: Uint8Array, name: string): Promise<ModelMet
     if (!obj) return
     if (obj.vertices.length > 0 && obj.triangles.length > 0) {
       const world = obj.vertices.map(([x, y, z]) => applyMat(x, y, z, transform))
+      // 3MF Core Spec §3.3: 変換は体積の符号を変えてはならない規約だが、鏡映
+      // （行列式が負）が実際に使われた場合、頂点座標だけ変換して巻き順を
+      // そのままにすると法線が内側を向く。b/cを入れ替えて巻き順ごと反転する。
+      const mirrored = determinant3x3(transform) < 0
       const faceNormals: [number, number, number][] = obj.vertices.map(() => [0, 0, 0])
-      for (const [a, b, c] of obj.triangles) {
+      for (const [a, b0, c0] of obj.triangles) {
+        const [b, c] = mirrored ? [c0, b0] : [b0, c0]
         if (a >= world.length || b >= world.length || c >= world.length) continue
         indices.push(vertOffset + a, vertOffset + b, vertOffset + c)
         const [ax, ay, az] = world[a]
