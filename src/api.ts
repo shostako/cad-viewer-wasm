@@ -9,7 +9,7 @@
  * サイドカー(計測の永続化)は localStorage に置く（backend もサーバも不要）。
  */
 import type { MeshPack } from './meshpack'
-import { loadStep, meshPackOf, distance, faceInfo, edgeInfo } from './occt'
+import { loadModel, meshPackOf, distance, faceInfo, edgeInfo } from './occt'
 
 export interface ModelMeta {
   id: string
@@ -31,7 +31,7 @@ export async function fetchDrawingSvg(_modelId: string): Promise<string> {
 
 export async function uploadModel(file: File): Promise<ModelMeta> {
   const bytes = new Uint8Array(await file.arrayBuffer())
-  return loadStep(bytes, file.name)
+  return loadModel(bytes, file.name)
 }
 
 export async function fetchMesh(modelId: string): Promise<MeshPack> {
