@@ -23,14 +23,18 @@ backend を消し、OpenCASCADE を WASM（[opencascade.js](https://github.com/d
 `main.ts` / `viewer.ts` / `picking.ts` / `measure.ts` はデータ源が Python サーバか
 WASM かを知らずに動く。計測の永続化(サイドカー)は localStorage。
 
-## 状態: スパイク（成立実証済み）
+## 状態: スパイク（成立実証済み）+ ファイル形式拡張済み
 
 実ブラウザ(Playwright/headless chromium)で **STEP読込 → Three.js描画 → 面ピック →
 BRepExtrema 真値距離** を確認済み（`spike_verify.py`、VERDICT: PASS、面間距離が
 箱の実寸法とピタリ一致）。
 
-### スパイクで未実装（本移植の残）
-- IGES / STL・3MF（メッシュ形式）
+対応形式: **STEP/IGES**（`occt.ts`、XSControl_Reader系・真値計測あり）、
+**STL**（`occt.ts`、StlAPI_Reader・format='mesh'で計測無効）、
+**3MF**（`threemf.ts`、OCCTを経由しない純JSのZIP+XMLメッシュ経路・format='mesh'）。
+いずれも実ブラウザで読込・描画・dedupを確認済み。
+
+### 未実装（本移植の残）
 - エッジ・頂点スナップ（現状は面ピックのみ）
 - アセンブリ展開・色・名前（XCAF）
 - 肉厚チェック（three-mesh-bvh でレイ法を移植予定）
