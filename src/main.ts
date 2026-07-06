@@ -436,6 +436,15 @@ testHooks.__cadFaceDistance = async (idA: number, idB: number) => {
     { partId: 0, kind: 'face', id: idB },
   )
 }
+// spike検証用: 肉厚計算を直接叩く（UIのトグル操作非依存の実証）
+testHooks.__cadThickness = async (method: 'ray' | 'ball') => {
+  if (!currentModelId) return null
+  const { fetchThickness } = await import('./api')
+  const map = await fetchThickness(currentModelId, method)
+  const out: Record<string, number[]> = {}
+  for (const [partId, arr] of map) out[String(partId)] = Array.from(arr)
+  return out
+}
 testHooks.__cadPick = (clientX: number, clientY: number) => {
   const rect = viewer.renderer.domElement.getBoundingClientRect()
   const ndc = new THREE.Vector2(
