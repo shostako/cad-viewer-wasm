@@ -101,6 +101,17 @@ function evictOthers(keepId: string): void {
   }
 }
 
+/**
+ * 全モデルを破棄する。3MF等 OCCT を経由しない他形式ローダーへ切り替わった際に
+ * api.ts から呼ばれる（Codexレビュー指摘: 切替を跨いで前の形式の WASM 形状が
+ * 破棄されず残り続けるとヒープを圧迫する）。embind オブジェクトは GC されない
+ * ため、Mapをクリアするだけでは漏れる — disposeModel を必ず経由する。
+ */
+export function disposeAll(): void {
+  for (const m of _models.values()) disposeModel(m)
+  _models.clear()
+}
+
 function disposeModel(m: LoadedModel): void {
   // embind オブジェクトは GC されない。明示 delete で WASM ヒープを返す。
   try {

@@ -9,8 +9,8 @@
  * サイドカー(計測の永続化)は localStorage に置く（backend もサーバも不要）。
  */
 import type { MeshPack } from './meshpack'
-import { loadModel, meshPackOf, distance, faceInfo, edgeInfo } from './occt'
-import { load3mf, meshPackOf3mf } from './threemf'
+import { loadModel, meshPackOf, distance, faceInfo, edgeInfo, disposeAll as disposeAllOcct } from './occt'
+import { load3mf, meshPackOf3mf, disposeAll as disposeAllThreeMf } from './threemf'
 
 export interface ModelMeta {
   id: string
@@ -35,8 +35,20 @@ export async function uploadModel(file: File): Promise<ModelMeta> {
   // 3MF は OCCT に読込手段が無いため専用の純JS経路（threemf.ts）へ分岐する。
   // モデルIDのプレフィックス（occt.ts='m', threemf.ts='t'）で fetchMesh 側の
   // 参照先レジストリを判定する。
-  if (file.name.toLowerCase().endsWith('.3mf')) return load3mf(bytes, file.name)
-  return loadModel(bytes, file.name)
+  //
+  // 罠(Codexレビュー指摘): 各ローダーは自分のレジストリ内でしか evictOthers
+  // しないため、形式を跨いで切り替える（STEP→3MF→STEP...）と前の形式の
+  // モデルが「もう一方」のレジストリに残り続ける。OCCT側は embind オブジェクトが
+  // GCされずWASMヒープを圧迫し続けるため実害が大きい。新モデルのパース成功後に
+  // 反対側のレジストリを破棄する（occt.ts自身の「成功後に破棄」規律と同じ順序）。
+  if (file.name.toLowerCase().endsWith('.3mf')) {
+    const meta = await load3mf(bytes, file.name)
+    disposeAllOcct()
+    return meta
+  }
+  const meta = await loadModel(bytes, file.name)
+  disposeAllThreeMf()
+  return meta
 }
 
 export async function fetchMesh(modelId: string): Promise<MeshPack> {

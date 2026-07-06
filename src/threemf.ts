@@ -302,6 +302,16 @@ function evictOthers(keepId: string): void {
   }
 }
 
+/**
+ * 全モデルを破棄する。STEP/IGES/STL等 occt.ts 側のローダーへ切り替わった際に
+ * api.ts から呼ばれる（Codexレビュー指摘: 切替を跨いで前の3MFメッシュ配列が
+ * 保持され続けるとメモリを圧迫する）。embindオブジェクトは持たないため
+ * Mapをクリアするだけで良い（TypedArrayはGCに委ねられる）。
+ */
+export function disposeAll(): void {
+  _models.clear()
+}
+
 export async function meshPackOf3mf(id: string): Promise<MeshPack> {
   const model = _models.get(id)
   if (!model) throw new Error(`unknown model id: ${id}`)
