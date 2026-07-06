@@ -30,6 +30,7 @@ import type {
   IPolylineEntity,
   IPointEntity,
   IInsertEntity,
+  ILayer,
 } from 'dxf-parser'
 
 export interface SnapPointOut {
@@ -181,20 +182,31 @@ function sampleArcLocalPoints(c: [number, number], r: number, startDeg: number, 
   return pts
 }
 
-function flattenEntities(entities: IEntity[], blocks: Record<string, IBlock>, x: Xform, depth: number, out: FlatEntity[]): void {
+function flattenEntities(
+  entities: IEntity[],
+  blocks: Record<string, IBlock>,
+  layers: Record<string, ILayer>,
+  x: Xform,
+  depth: number,
+  out: FlatEntity[],
+): void {
   for (const e of entities) {
-    // Codexレビュー指摘(P2): 可視性フラグ(グループコード60)でvisible===false
-    // の非表示エンティティ(補助線等)まで描画・スナップ対象にしていた。
+    // Codexレビュー指摘(P2、2件): 可視性フラグ(グループコード60)でvisible===false
+    // の非表示エンティティ(補助線等)に加え、レイヤー自体がOFF/FROZENの場合も
+    // 非表示として扱う必要がある（backendのezdxfはレイヤー状態も含めて描画する
+    // ため、こちらも揃える）。
     if ((e as { visible?: boolean }).visible === false) continue
+    const layer = layers[(e as { layer?: string }).layer ?? '']
+    if (layer && (layer.visible === false || layer.frozen)) continue
     try {
-      flattenOne(e, blocks, x, depth, out)
+      flattenOne(e, blocks, layers, x, depth, out)
     } catch {
       // 壊れた/未対応のエンティティはスキップ（backendのezdxf側と同じ方針）
     }
   }
 }
 
-function flattenOne(e: IEntity, blocks: Record<string, IBlock>, x: Xform, depth: number, out: FlatEntity[]): void {
+function flattenOne(e: IEntity, blocks: Record<string, IBlock>, layers: Record<string, ILayer>, x: Xform, depth: number, out: FlatEntity[]): void {
   const t = (e as { type?: string }).type
   switch (t) {
     case 'LINE': {
@@ -331,7 +343,7 @@ function flattenOne(e: IEntity, blocks: Record<string, IBlock>, x: Xform, depth:
         for (let col = 0; col < cols; col++) {
           const arrayOffset: Xform = { ...IDENTITY, dx: col * colSp, dy: row * rowSp }
           const withArray = composeXform(combined, arrayOffset)
-          flattenEntities(block.entities ?? [], blocks, withArray, depth + 1, out)
+          flattenEntities(block.entities ?? [], blocks, layers, withArray, depth + 1, out)
         }
       }
       return
@@ -577,9 +589,16 @@ function collectSnaps(flat: FlatEntity[], bb: { min: [number, number]; max: [num
     } else if (e.type === 'point') {
       add(e.p, 'point')
     } else if (e.type === 'ellipsePoly') {
-      // Codexレビュー指摘(P2): 非一様スケール配下の円/弧(ellipsePoly)に
+      // Codexレビュー指摘(P2、2件): 非一様スケール配下の円/弧(ellipsePoly)に
       // centerスナップが無く、穴/シンボルの中心を計測モードで拾えなかった。
+      // 加えて、ARC由来のellipsePolyはサンプリング済み点列の先頭/末尾が
+      // 変換後の弧の端点そのものなので、それも'end'スナップとして拾う
+      // （CIRCLE由来の場合は先頭≒末尾で同一点が重複登録されるだけで無害）。
       add(e.center, 'center')
+      if (e.pts.length > 0) {
+        add(e.pts[0], 'end')
+        add(e.pts[e.pts.length - 1], 'end')
+      }
     }
   }
   return out
@@ -606,7 +625,8 @@ export async function loadDxf(bytes: Uint8Array, filename: string): Promise<Mode
   if (!dxf) throw new Error('DXF読み込み失敗: パース結果が空')
 
   const flat: FlatEntity[] = []
-  flattenEntities(dxf.entities ?? [], dxf.blocks ?? {}, IDENTITY, 0, flat)
+  const layers = dxf.tables?.layer?.layers ?? {}
+  flattenEntities(dxf.entities ?? [], dxf.blocks ?? {}, layers, IDENTITY, 0, flat)
   if (flat.length === 0) throw new Error('図面に描画エンティティが無い（対応エンティティ: LINE/CIRCLE/ARC/LWPOLYLINE/POLYLINE/POINT/INSERT）')
 
   const bb = computeBbox(flat)
