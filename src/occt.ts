@@ -355,16 +355,23 @@ export async function loadModel(bytes: Uint8Array, name: string): Promise<ModelM
   // （Codexレビュー指摘: 固定値0.1だとメートル単位の小さい円弧・穴がほぼ潰れ、
   // 見た目上は曲線があるのにスナップ/計測できなくなるモデルスケール依存バグ）。
   model.meshPack = buildMeshPack(oc, model, linDefl)
-  _models.set(id, model)
-  // パース成功が確定してから旧モデルを破棄する（読込失敗時に表示中モデルを
-  // 巻き込まないため）。瞬間的に旧+新が同居するが、正しさをメモリ最小化より優先。
-  // Codexレビュー指摘: 自分の開始後により新しい読込が始まっていた場合、その
-  // 新しい読込が既に完了しUIの「現在のモデル」になっている可能性がある。
-  // ここでevictOthersすると現在のモデルまで巻き込んで_modelsから消してしまう
-  // ため、その場合はevictをスキップする（例外は投げない — main.tsのエラー
-  // ハンドラはstale判定なしに表示中HUDを上書きするため、ここで失敗させると
-  // 現在正常に表示されているモデルの上にエラーメッセージが出てしまう）。
-  if (gen === _loadGen) evictOthers(id)
+  // Codexレビュー指摘: 自分の開始後により新しい読込が既に完了していた場合、
+  // このモデルはUIに表示されることが無い（main.ts側のloadGenでも同じ理由で
+  // 無視される）。_modelsに残したままevictだけスキップすると、以降どこかの
+  // 読込がevictOthersするまで、表示されないshape/faces/meshPack(embind
+  // オブジェクト)がWASMヒープに残り続けてしまう（数百MBのOCCTヒープを
+  // 切り離す狙いと逆行する）。その場でdisposeして_modelsにも残さない
+  // （例外は投げない — main.tsのエラーハンドラはstale判定なしに表示中HUDを
+  // 上書きするため、ここで失敗させると現在正常に表示されているモデルの上に
+  // エラーメッセージが出てしまう）。
+  if (gen === _loadGen) {
+    _models.set(id, model)
+    // パース成功が確定してから旧モデルを破棄する（読込失敗時に表示中モデルを
+    // 巻き込まないため）。瞬間的に旧+新が同居するが、正しさをメモリ最小化より優先。
+    evictOthers(id)
+  } else {
+    disposeModel(model)
+  }
 
   return metaOf(model)
 }

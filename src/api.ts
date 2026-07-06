@@ -71,13 +71,19 @@ export async function uploadModel(file: File): Promise<ModelMeta> {
   }
   if (lower.endsWith('.dxf')) {
     const meta = await loadDxf(bytes, file.name)
-    await occtWorker.disposeAll()
+    // Codexレビュー指摘: occtWorker.disposeAll()をawaitすると、OCCT Workerが
+    // 大きいSTEP/STLの重い同期パース中はそのRPCがキューの後ろで詰まり、
+    // 既にパース完了しているDXF/3MFの表示までブロックされてしまう
+    // （Worker化でUIスレッドは守れても、Worker自体がビジーだと「切替」操作が
+    // 巻き込まれる）。破棄はメモリ解放のみが目的で戻り値のmetaに影響しない
+    // ため、待たずに投げっぱなしにする。
+    void occtWorker.disposeAll().catch(() => {})
     disposeAllThreeMf()
     return meta
   }
   if (lower.endsWith('.3mf')) {
     const meta = await load3mf(bytes, file.name)
-    await occtWorker.disposeAll()
+    void occtWorker.disposeAll().catch(() => {})
     disposeAllDxf()
     return meta
   }

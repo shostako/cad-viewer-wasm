@@ -314,6 +314,24 @@ evict/コミット時のevictをスキップする」よう修正（例外は投
 修正前は後発モデルの`fetchMesh`が`unknown model id`で失敗することを確認し、
 修正後は失敗しなくなることを確認した。
 
+**罠（Codexレビュー指摘、実測で確認・修正済み、2件）**:
+1. 上記の世代ガードは「supersededされた読込のevictをスキップする」だけで、
+   その読込自身が作った新しいモデル（shape/faces/meshPack等のembind
+   オブジェクト）は`_models`に入れたまま放置していた。UIには一生表示されない
+   のに、後で何かの読込がevictOthersするまでWASMヒープに残り続ける
+   （数百MBのOCCTヒープを切り離す狙いと逆行する）。supersededな場合は
+   `_models`に入れずその場でdisposeするよう修正。
+2. `api.ts`の`uploadModel`がDXF/3MFへ切り替える際、`occtWorker.disposeAll()`
+   を`await`していたため、OCCT Workerが大きいSTEP/STLの重いパースで
+   詰まっている間はそのRPCがキューの後ろで待たされ、既にパース完了している
+   DXF/3MFの表示までブロックされていた（Worker化でUIスレッドは守れても、
+   Worker自体がビジーだと「切替」操作が巻き込まれる）。破棄はメモリ解放が
+   目的で戻り値のmetaに影響しないため、await せず投げっぱなしにするよう修正。
+
+実ブラウザで、supersededされたモデルが`_models`に残らずdisposeされること
+（`fetchMesh`が期待通り失敗すること）、OCCT側を人為的に遅延させても
+DXFへの切替が待たされず完了することを確認した。
+
 ## 開発
 
 ```bash
