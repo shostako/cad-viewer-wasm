@@ -112,6 +112,36 @@ export function disposeAll(): void {
   _models.clear()
 }
 
+/**
+ * embind オブジェクトの一括破棄。GC されないため計測・テッセレーションの
+ * ホットパスで必ず使う。実ブラウザで安全性を検証済み（下記の唯一の例外を除き、
+ * 「派生オブジェクトを取り出した後に元オブジェクトを delete」しても派生側は
+ * 生き続ける）:
+ *   - reader.delete() は OneShape() で取り出した shape に影響しない
+ *   - box.delete() は CornerMin/CornerMax の戻り値に影響しない
+ *   - triHandle.delete() は .get() の戻り値(tri)に影響しない
+ *   - loc.delete() は .Transformation() の戻り値(trsf)に影響しない
+ *   - tri.Node(i) の戻り値は .Transformed(trsf) の戻り値を取った後に delete して良い
+ *   - tri.Triangle(i) の戻り値は Value() を読んだ後に delete して良い
+ *   - cyl/axis (Cylinder/Axis) は Location()/Direction() を取った後に delete して良い
+ *   - 既存の永続 Face を再キャストした一時オブジェクトを delete しても、
+ *     永続側（model.faces の元エントリ）は壊れない
+ * 唯一の例外（実測でクラッシュ確認済み・delete 禁止）:
+ *   - TopExp_Explorer.Current() の戻り値。TopoDS.Face_1() 等でキャストした「後」に
+ *     Current() 側を delete すると、キャスト結果ごと WASM ヒープが破壊される
+ *     （wasmTable.get(...) is not a function で無関係な後続呼び出しがクラッシュする）。
+ *     Explorer 自体（ループを回し終えた後の exp）は delete して問題ない。
+ */
+function del(...objs: Array<OC | null | undefined>): void {
+  for (const o of objs) {
+    try {
+      o?.delete?.()
+    } catch {
+      /* 破棄失敗は致命ではない */
+    }
+  }
+}
+
 function disposeModel(m: LoadedModel): void {
   // embind オブジェクトは GC されない。明示 delete で WASM ヒープを返す。
   try {
@@ -148,18 +178,24 @@ function readXsShape(oc: OC, kind: 'step' | 'iges', bytes: Uint8Array): OC {
   // コピーするので安全。
   oc.FS.writeFile(virtualPath, bytes)
   const reader = kind === 'step' ? new oc.STEPControl_Reader_1() : new oc.IGESControl_Reader_1()
-  reader.ReadFile(virtualPath)
-  const nRoots = reader.NbRootsForTransfer()
-  oc.FS.unlink(virtualPath)
-  // ReadFile が返す IFSelect_ReturnStatus 列挙は embind 上で値比較が当てにならない
-  // （RetDone との一致が取れない）。成否は「転送可能ルート数」で判定する。
-  if (nRoots < 1) {
-    throw new Error(`${kind.toUpperCase()}読込失敗（ファイル破損・非対応、または転送ルート無し）`)
+  try {
+    reader.ReadFile(virtualPath)
+    const nRoots = reader.NbRootsForTransfer()
+    oc.FS.unlink(virtualPath)
+    // ReadFile が返す IFSelect_ReturnStatus 列挙は embind 上で値比較が当てにならない
+    // （RetDone との一致が取れない）。成否は「転送可能ルート数」で判定する。
+    if (nRoots < 1) {
+      throw new Error(`${kind.toUpperCase()}読込失敗（ファイル破損・非対応、または転送ルート無し）`)
+    }
+    reader.TransferRoots()
+    const shape = reader.OneShape()
+    if (shape.IsNull()) throw new Error(`${kind.toUpperCase()}: 形状が空`)
+    return shape
+  } finally {
+    // reader 自体（WS/Model等の内部状態）は shape 抽出後は不要。del()で安全に破棄
+    // できることを実測済み（shape 側には影響しない）。
+    del(reader)
   }
-  reader.TransferRoots()
-  const shape = reader.OneShape()
-  if (shape.IsNull()) throw new Error(`${kind.toUpperCase()}: 形状が空`)
-  return shape
 }
 
 /** STL を StlAPI_Reader で読む。パラメトリック面を持たないテッセレーション済み形状。 */
@@ -173,10 +209,14 @@ function readStlShape(oc: OC, bytes: Uint8Array): OC {
   oc.FS.writeFile(virtualPath, bytes)
   const shape = new oc.TopoDS_Shape()
   const reader = new oc.StlAPI_Reader()
-  const ok = reader.Read(shape, virtualPath)
-  oc.FS.unlink(virtualPath)
-  if (!ok || shape.IsNull()) throw new Error('STL読込失敗（ファイル破損・非対応）')
-  return shape
+  try {
+    const ok = reader.Read(shape, virtualPath)
+    oc.FS.unlink(virtualPath)
+    if (!ok || shape.IsNull()) throw new Error('STL読込失敗（ファイル破損・非対応）')
+    return shape
+  } finally {
+    del(reader)
+  }
 }
 
 /** モデルファイルを読み、shape と面配列を格納して ModelMeta を返す。 */
@@ -217,21 +257,22 @@ export async function loadModel(bytes: Uint8Array, name: string): Promise<ModelM
     bbox.max[2] - bbox.min[2],
   )
   const linDefl = Math.max(diag * 1e-3, 1e-6)
-  new oc.BRepMesh_IncrementalMesh_2(shape, linDefl, false, 0.35, true)
+  const mesher = new oc.BRepMesh_IncrementalMesh_2(shape, linDefl, false, 0.35, true)
+  del(mesher) // アルゴリズムオブジェクト自体は shape へ書き込み済みで用済み（実測済み）
 
-  // 面を走査順に配列化（faceId = index+1）
+  // 面を走査順に配列化（faceId = index+1）。
+  // 罠: exp.Current() の戻り値は delete 禁止（キャストした Face 側ごと壊れる。
+  // 実測でクラッシュ確認済み）。Explorer 自体はループを抜けたら delete して良い。
   const faces: OC[] = []
-  for (
-    const exp = new oc.TopExp_Explorer_2(
-      shape,
-      oc.TopAbs_ShapeEnum.TopAbs_FACE,
-      oc.TopAbs_ShapeEnum.TopAbs_SHAPE,
-    );
-    exp.More();
-    exp.Next()
-  ) {
+  const exp = new oc.TopExp_Explorer_2(
+    shape,
+    oc.TopAbs_ShapeEnum.TopAbs_FACE,
+    oc.TopAbs_ShapeEnum.TopAbs_SHAPE,
+  )
+  for (; exp.More(); exp.Next()) {
     faces.push(oc.TopoDS.Face_1(exp.Current()))
   }
+  del(exp)
 
   const model: LoadedModel = {
     id,
@@ -258,11 +299,19 @@ export async function loadModel(bytes: Uint8Array, name: string): Promise<ModelM
 
 function computeBBox(oc: OC, shape: OC): { min: number[]; max: number[] } {
   const box = new oc.Bnd_Box_1()
-  oc.BRepBndLib.Add(shape, box, false)
-  if (box.IsVoid()) return { min: [0, 0, 0], max: [0, 0, 0] }
-  const lo = box.CornerMin()
-  const hi = box.CornerMax()
-  return { min: [lo.X(), lo.Y(), lo.Z()], max: [hi.X(), hi.Y(), hi.Z()] }
+  try {
+    oc.BRepBndLib.Add(shape, box, false)
+    if (box.IsVoid()) return { min: [0, 0, 0], max: [0, 0, 0] }
+    const lo = box.CornerMin()
+    const hi = box.CornerMax()
+    try {
+      return { min: [lo.X(), lo.Y(), lo.Z()], max: [hi.X(), hi.Y(), hi.Z()] }
+    } finally {
+      del(lo, hi)
+    }
+  } finally {
+    del(box)
+  }
 }
 
 /** load時に構築済みの MeshPack を返す。 */
@@ -291,22 +340,36 @@ function buildMeshPack(oc: OC, model: LoadedModel): MeshPack {
     const face = model.faces[fi]
     const loc = new oc.TopLoc_Location_1()
     const triHandle = oc.BRep_Tool.Triangulation(face, loc)
-    if (triHandle.IsNull()) continue
+    if (triHandle.IsNull()) {
+      del(triHandle, loc)
+      continue
+    }
     const tri = triHandle.get()
+    del(triHandle) // .get()の戻り値とは独立（実測済み）。ハンドル自体は用済み
     const nNodes: number = tri.NbNodes()
     const nTris: number = tri.NbTriangles()
-    if (nTris === 0) continue
+    if (nTris === 0) {
+      del(tri, loc)
+      continue
+    }
 
     const trsf = loc.Transformation()
+    del(loc) // Transformation()の戻り値とは独立（実測済み）
 
-    // ノード座標（ロケーション変換適用）
+    // ノード座標（ロケーション変換適用）。tri.Node(i)の生の点は変換後の点を
+    // 取り出した直後に破棄する（実測済み: 変換元の破棄は変換後オブジェクトに
+    // 影響しない）。頂点数スケールで最大の漏れ源だったため必ず破棄する。
     const nodeXYZ = new Float32Array(nNodes * 3)
     for (let i = 1; i <= nNodes; i++) {
-      const p = tri.Node(i).Transformed(trsf)
+      const raw = tri.Node(i)
+      const p = raw.Transformed(trsf)
+      del(raw)
       nodeXYZ[(i - 1) * 3] = p.X()
       nodeXYZ[(i - 1) * 3 + 1] = p.Y()
       nodeXYZ[(i - 1) * 3 + 2] = p.Z()
+      del(p)
     }
+    del(trsf)
 
     // 三角形 → インデックス（1-based → 0-based）。巻き順から法線を積算。
     const nodeNormals = new Float32Array(nNodes * 3)
@@ -316,6 +379,7 @@ function buildMeshPack(oc: OC, model: LoadedModel): MeshPack {
       const a = t.Value(1) - 1
       const b = t.Value(2) - 1
       const c = t.Value(3) - 1
+      del(t)
       faceTris.push([a, b, c])
       // 面法線（外積）を3頂点に加算（面内スムーズ法線）
       const ax = nodeXYZ[a * 3], ay = nodeXYZ[a * 3 + 1], az = nodeXYZ[a * 3 + 2]
@@ -351,6 +415,7 @@ function buildMeshPack(oc: OC, model: LoadedModel): MeshPack {
     faceRanges.push({ faceId: fi + 1, triStart: triOffset, triCount: nTris })
     vertOffset += nNodes
     triOffset += nTris
+    del(tri)
   }
 
   model.triangleCount = triOffset
@@ -405,14 +470,30 @@ function desc(dtype: 'float32' | 'uint32', count: number) {
 
 // -------------------------------------------------------------- 計測（真値）
 
-function resolveShape(oc: OC, model: LoadedModel, ref: EntityRef): OC {
+/**
+ * 参照先の shape。owned=true は呼び出し側が使用後に del() する責務を持つ
+ * 一時オブジェクト（point 参照で毎回新規に作る Vertex）。owned=false は
+ * model.faces から借用した永続オブジェクトで、delete 禁止（今後の計測でも
+ * 使い回すため）。この区別を怠ると point 参照が漏れ続けるか、face 参照を
+ * 誤って破棄して以後の計測が壊れるかのどちらかになる。
+ */
+interface ResolvedShape {
+  shape: OC
+  owned: boolean
+}
+
+function resolveShape(oc: OC, model: LoadedModel, ref: EntityRef): ResolvedShape {
   if (ref.kind === 'point' && ref.xyz) {
-    return new oc.BRepBuilderAPI_MakeVertex(new oc.gp_Pnt_3(ref.xyz[0], ref.xyz[1], ref.xyz[2])).Vertex()
+    const pnt = new oc.gp_Pnt_3(ref.xyz[0], ref.xyz[1], ref.xyz[2])
+    const maker = new oc.BRepBuilderAPI_MakeVertex(pnt)
+    const vertex = maker.Vertex()
+    del(pnt, maker) // Vertex()の戻り値とは独立（実測済み）
+    return { shape: vertex, owned: true }
   }
   if (ref.kind === 'face' && ref.id) {
     const f = model.faces[ref.id - 1]
     if (!f) throw new Error(`face id ${ref.id} out of range`)
-    return f
+    return { shape: f, owned: false }
   }
   // エッジ/頂点はスパイク未対応（picking も現状 face のみ返す）
   throw new Error(`スパイク未対応の参照種別: ${ref.kind}`)
@@ -423,13 +504,13 @@ export async function distance(id: string, a: EntityRef, b: EntityRef): Promise<
   const oc = await initOcct()
   const model = _models.get(id)
   if (!model) throw new Error(`unknown model id: ${id}`)
-  const sa = resolveShape(oc, model, a)
-  const sb = resolveShape(oc, model, b)
+  const ra = resolveShape(oc, model, a)
+  const rb = resolveShape(oc, model, b)
   // BRepExtrema wrapper は WASM ヒープ上の embind オブジェクト。GC されないので
   // 数値を JS 側へ写し取った後、必ず delete して解放する（計測は繰り返される）。
   const ext = new oc.BRepExtrema_DistShapeShape_2(
-    sa,
-    sb,
+    ra.shape,
+    rb.shape,
     oc.Extrema_ExtFlag.Extrema_ExtFlag_MIN,
     oc.Extrema_ExtAlgo.Extrema_ExtAlgo_Grad,
   )
@@ -437,14 +518,20 @@ export async function distance(id: string, a: EntityRef, b: EntityRef): Promise<
     if (!ext.IsDone() || ext.NbSolution() < 1) throw new Error('距離計算に失敗')
     const pa = ext.PointOnShape1(1)
     const pb = ext.PointOnShape2(1)
-    return {
-      type: 'distance',
-      value: ext.Value(),
-      pointA: [pa.X(), pa.Y(), pa.Z()],
-      pointB: [pb.X(), pb.Y(), pb.Z()],
+    try {
+      return {
+        type: 'distance',
+        value: ext.Value(),
+        pointA: [pa.X(), pa.Y(), pa.Z()],
+        pointB: [pb.X(), pb.Y(), pb.Z()],
+      }
+    } finally {
+      del(pa, pb)
     }
   } finally {
-    ext.delete?.()
+    del(ext)
+    if (ra.owned) del(ra.shape)
+    if (rb.owned) del(rb.shape)
   }
 }
 
@@ -453,7 +540,8 @@ export async function faceInfo(id: string, ref: EntityRef): Promise<FaceInfoResu
   const oc = await initOcct()
   const model = _models.get(id)
   if (!model) throw new Error(`unknown model id: ${id}`)
-  const face = oc.TopoDS.Face_1(resolveShape(oc, model, ref))
+  const resolved = resolveShape(oc, model, ref)
+  const face = oc.TopoDS.Face_1(resolved.shape)
 
   // props / surf は embind オブジェクト。数値を写し取ったら delete して解放する。
   const props = new oc.GProp_GProps_1()
@@ -466,22 +554,29 @@ export async function faceInfo(id: string, ref: EntityRef): Promise<FaceInfoResu
     if (stype === oc.GeomAbs_SurfaceType.GeomAbs_Cylinder.value) {
       const cyl = surf.Cylinder()
       const c = cyl.Location()
-      const ax = cyl.Axis().Direction()
+      const axis = cyl.Axis()
+      const ax = axis.Direction()
       out.surface = 'cylinder'
       out.radius = cyl.Radius()
       out.diameter = 2 * cyl.Radius()
       out.center = [c.X(), c.Y(), c.Z()]
       out.axis = [ax.X(), ax.Y(), ax.Z()]
+      del(cyl, axis, c, ax) // Location()/Direction()の戻り値は独立（実測済み）
     } else if (stype === oc.GeomAbs_SurfaceType.GeomAbs_Plane.value) {
       const pln = surf.Plane()
-      const n = pln.Axis().Direction()
+      const axis = pln.Axis()
+      const n = axis.Direction()
       out.surface = 'plane'
       out.normal = [n.X(), n.Y(), n.Z()]
+      del(pln, axis, n)
     }
     return out
   } finally {
-    props.delete?.()
-    surf.delete?.()
+    del(props, surf, face)
+    // face は resolved.shape (model.faces の永続 Face、または point参照の一時
+    // Vertex) を再キャストしたもの。再キャスト結果を破棄しても永続側は壊れない
+    // ことを実測済み。owned な一時オブジェクトは resolved 側も破棄する。
+    if (resolved.owned) del(resolved.shape)
   }
 }
 
