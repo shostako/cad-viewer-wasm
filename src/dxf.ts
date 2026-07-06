@@ -75,10 +75,15 @@ function metaOf(d: LoadedDrawing): ModelMeta {
 
 // --- ワールド座標へ平坦化したエンティティ（INSERT展開後） -------------------
 
+// arc の startDeg/sweepDeg: sweepDeg は符号付き（+=数学的CCW、-=CW）。
+// s=startDeg, e=startDeg+sweepDeg として、実際の弧は s から e まで
+// （sweepDegが負なら減少方向に）掃引する。大きさ|sweepDeg|は変換
+// （回転・一様スケール・鏡映）で不変なので、鏡映の軸によらず常に正しい
+// （鏡映で反転するのは向きの符号だけ）。
 type FlatEntity =
   | { type: 'line'; a: [number, number]; b: [number, number] }
   | { type: 'circle'; c: [number, number]; r: number }
-  | { type: 'arc'; c: [number, number]; r: number; startDeg: number; endDeg: number }
+  | { type: 'arc'; c: [number, number]; r: number; startDeg: number; sweepDeg: number }
   | { type: 'polyline'; pts: [number, number][]; bulges: number[]; closed: boolean }
   | { type: 'point'; p: [number, number] }
   | { type: 'ellipsePoly'; pts: [number, number][] } // 非一様スケールで円/弧が楕円になる場合の近似
@@ -170,20 +175,43 @@ function flattenOne(e: IEntity, blocks: Record<string, IBlock>, x: Xform, depth:
     }
     case 'ARC': {
       const ae = e as IArcEntity
+      // 罠(実測で発覚): dxf-parserの startAngle/endAngle は度ではなくラジアン
+      // で返る（実測値 6.1087 rad ≒ 350°、度だと誤解して1/180で処理すると
+      // 全く違う角度になる）。angleLength も信用しない（実測で単純な
+      // endAngle-startAngle らしき負値(-π)を確認済みで、CCW正規化されている
+      // 保証が無い）。DXFのARCエンティティは常にネイティブ座標系で
+      // startAngleからendAngleまでCCW（角度増加、0/360をまたぐ場合は+360）で
+      // 定義されるため、度に変換したうえで自前でラップして求める。
+      const startDeg0 = (ae.startAngle * 180) / Math.PI
+      const endDeg0 = (ae.endAngle * 180) / Math.PI
+      const nativeSweepDeg = (((endDeg0 - startDeg0) % 360) + 360) % 360
       if (isUniform(x)) {
-        // 反転(sx*sy<0)は弧の走行方向を逆転させる
+        // 罠(実測で発覚): 鏡映変換(sx*sy<0)後の開始角を「flip ? -endAngle :
+        // startAngle」のような単一の代数式で求めようとすると、Y軸鏡映
+        // (angle→-angle)とX軸鏡映(angle→180-angle)で変換式が異なるため、
+        // sx*sy<0という条件だけでは判別できず誤る。代わりに「変換前の
+        // 開始点を実際にapplyXformで変換し、結果の座標からatan2で角度を
+        // 逆算する」方式にする。回転・スケール・鏡映のどの組み合わせでも
+        // 変換の意味論を個別に場合分けする必要がなくなり頑健。
+        // sweepの大きさ(nativeSweepDeg)は相似変換で不変。符号（向き）だけが
+        // 鏡映(行列式sx*sy<0、軸によらず一般的に正しい判定)で反転する。
+        const pStart0: [number, number] = [
+          ae.center.x + ae.radius * Math.cos(ae.startAngle),
+          ae.center.y + ae.radius * Math.sin(ae.startAngle),
+        ]
+        const cWorld = applyXform(x, [ae.center.x, ae.center.y])
+        const pStartWorld = applyXform(x, pStart0)
+        const startDeg = (Math.atan2(pStartWorld[1] - cWorld[1], pStartWorld[0] - cWorld[0]) * 180) / Math.PI
         const flip = x.sx * x.sy < 0
-        const start = flip ? -ae.endAngle : ae.startAngle
-        const end = flip ? -ae.startAngle : ae.endAngle
         out.push({
           type: 'arc',
-          c: applyXform(x, [ae.center.x, ae.center.y]),
+          c: cWorld,
           r: ae.radius * Math.abs(x.sx),
-          startDeg: start + x.rotDeg,
-          endDeg: end + x.rotDeg,
+          startDeg,
+          sweepDeg: flip ? -nativeSweepDeg : nativeSweepDeg,
         })
       } else {
-        out.push({ type: 'ellipsePoly', pts: sampleEllipse([ae.center.x, ae.center.y], ae.radius, x, ae.startAngle, ae.endAngle) })
+        out.push({ type: 'ellipsePoly', pts: sampleEllipse([ae.center.x, ae.center.y], ae.radius, x, startDeg0, endDeg0) })
       }
       return
     }
@@ -262,14 +290,16 @@ function polySegments(pts: [number, number][], bulges: number[], closed: boolean
   return segs
 }
 
-/** bulge(tan(内角/4)) → 円弧の中心・半径・開始/終了角(deg)。直線ならnull。 */
-function bulgeArc(a: [number, number], b: [number, number], bulge: number): { c: [number, number]; r: number; startDeg: number; endDeg: number } | null {
+/** bulge(tan(内角/4)) → 円弧の中心・半径・開始角・符号付き掃引角。直線ならnull。
+ * sweepDeg = theta（符号付き内角）そのもの。startDeg+sweepDeg が b の角度に
+ * 一致することは解析的に確認済み（bulge<0の例で135°→(135-90)=45°と一致）。 */
+function bulgeArc(a: [number, number], b: [number, number], bulge: number): { c: [number, number]; r: number; startDeg: number; sweepDeg: number } | null {
   if (Math.abs(bulge) < 1e-12) return null
   const dx = b[0] - a[0]
   const dy = b[1] - a[1]
   const chord = Math.hypot(dx, dy)
   if (chord < 1e-12) return null
-  const theta = 4 * Math.atan(bulge) // 内角（符号付き、+=CCW）
+  const theta = 4 * Math.atan(bulge) // 内角（符号付き、+=CCW）、単位rad
   const r = chord / (2 * Math.sin(theta / 2))
   const mx = (a[0] + b[0]) / 2
   const my = (a[1] + b[1]) / 2
@@ -282,8 +312,7 @@ function bulgeArc(a: [number, number], b: [number, number], bulge: number): { c:
   const cx = mx + ux * h
   const cy = my + uy * h
   const startDeg = (Math.atan2(a[1] - cy, a[0] - cx) * 180) / Math.PI
-  const endDeg = (Math.atan2(b[1] - cy, b[0] - cx) * 180) / Math.PI
-  return { c: [cx, cy], r: Math.abs(r), startDeg, endDeg }
+  return { c: [cx, cy], r: Math.abs(r), startDeg, sweepDeg: (theta * 180) / Math.PI }
 }
 
 // --- bbox --------------------------------------------------------------
@@ -295,20 +324,27 @@ function extendBbox(bb: { min: [number, number]; max: [number, number] }, p: [nu
   if (p[1] > bb.max[1]) bb.max[1] = p[1]
 }
 
-function arcExtrema(c: [number, number], r: number, startDeg: number, endDeg: number): [number, number][] {
+/** 符号付き掃引角(sweepDeg、+=増加/CCW, -=減少/CW)で弧の極値点を求める。
+ * s=startDeg, e=startDeg+sweepDeg として [min(s,e), max(s,e)] の範囲に入る
+ * 90度刻みの角度（象限の頂点）を全て候補にする — endDegを別途正規化して
+ * 「常にs<eになるよう360を足す」ような向き依存のヒューリスティックを使わない
+ * （Codexレビュー指摘: 時計回りの弧でこの手のヒューリスティックが弧の向きを
+ * 誤って優弧側に倒すバグを実際に踏んだため、符号付き量をそのまま使う設計にした）。 */
+function arcExtrema(c: [number, number], r: number, startDeg: number, sweepDeg: number): [number, number][] {
   const pts: [number, number][] = []
-  const norm = (d: number) => ((d % 360) + 360) % 360
-  const s = norm(startDeg)
-  let e = norm(endDeg)
-  if (e <= s) e += 360
-  pts.push([c[0] + r * Math.cos((s * Math.PI) / 180), c[1] + r * Math.sin((s * Math.PI) / 180)])
-  pts.push([c[0] + r * Math.cos((e * Math.PI) / 180), c[1] + r * Math.sin((e * Math.PI) / 180)])
-  for (const cardinal of [0, 90, 180, 270, 360]) {
-    if (cardinal >= s && cardinal <= e) {
-      const a = (cardinal * Math.PI) / 180
-      pts.push([c[0] + r * Math.cos(a), c[1] + r * Math.sin(a)])
-    }
+  const s = startDeg
+  const e = startDeg + sweepDeg
+  const point = (deg: number): [number, number] => {
+    const a = (deg * Math.PI) / 180
+    return [c[0] + r * Math.cos(a), c[1] + r * Math.sin(a)]
   }
+  pts.push(point(s))
+  pts.push(point(e))
+  const lo = Math.min(s, e)
+  const hi = Math.max(s, e)
+  const startK = Math.ceil(lo / 90)
+  const endK = Math.floor(hi / 90)
+  for (let k = startK; k <= endK; k++) pts.push(point(k * 90))
   return pts
 }
 
@@ -322,8 +358,19 @@ function computeBbox(flat: FlatEntity[]): { min: [number, number]; max: [number,
       extendBbox(bb, [e.c[0] - e.r, e.c[1] - e.r])
       extendBbox(bb, [e.c[0] + e.r, e.c[1] + e.r])
     } else if (e.type === 'arc') {
-      for (const p of arcExtrema(e.c, e.r, e.startDeg, e.endDeg)) extendBbox(bb, p)
-    } else if (e.type === 'polyline' || e.type === 'ellipsePoly') {
+      for (const p of arcExtrema(e.c, e.r, e.startDeg, e.sweepDeg)) extendBbox(bb, p)
+    } else if (e.type === 'polyline') {
+      // Codexレビュー指摘(P2): 頂点だけでは足りない。bulge付きセグメントは
+      // 弦の外側に膨らむ（半円なら弦の中点から半径ぶん飛び出る）ので、
+      // 円弧セグメントは実際の弧の極値（arcExtrema）でbboxを広げる必要がある。
+      for (const p of e.pts) extendBbox(bb, p)
+      for (const seg of polySegments(e.pts, e.bulges, e.closed)) {
+        const arc = bulgeArc(seg.a, seg.b, seg.bulge)
+        if (arc) {
+          for (const p of arcExtrema(arc.c, arc.r, arc.startDeg, arc.sweepDeg)) extendBbox(bb, p)
+        }
+      }
+    } else if (e.type === 'ellipsePoly') {
       for (const p of e.pts) extendBbox(bb, p)
     } else if (e.type === 'point') {
       extendBbox(bb, e.p)
@@ -334,20 +381,35 @@ function computeBbox(flat: FlatEntity[]): { min: [number, number]; max: [number,
 
 // --- SVG生成 -------------------------------------------------------------
 
-function arcPathD(to: (p: [number, number]) => [number, number], c: [number, number], r: number, startDeg: number, endDeg: number): string {
-  let sweep = endDeg - startDeg
-  while (sweep <= 0) sweep += 360
-  while (sweep > 360) sweep -= 360
-  const p0 = to([c[0] + r * Math.cos((startDeg * Math.PI) / 180), c[1] + r * Math.sin((startDeg * Math.PI) / 180)])
-  const p1 = to([c[0] + r * Math.cos(((startDeg + sweep) * Math.PI) / 180), c[1] + r * Math.sin(((startDeg + sweep) * Math.PI) / 180)])
-  const largeArc = sweep > 180 ? 1 : 0
-  // to()はy反転を行うため、DXF空間でCCW(数学的正)の弧はSVG空間ではCW(sweep-flag=1)になる
-  if (sweep >= 359.999) {
+/** SVG座標系(y下向き)でstart→mid→endの向きからsweep-flagを求める。
+ * DXF側のCCW/CW・鏡映変換の向きに関する場合分けを一切せず、実際に
+ * レンダリングされる3点の位置関係だけから機械的に決める（bulge符号を
+ * 素朴に読み替えて一度符号を誤ったため、変換に依存しない頑健な方式にした）。
+ * cross>0（y下向き系で視覚的に時計回り）なら sweep-flag=1。 */
+function sweepFlagFromThreePoints(pStart: [number, number], pMid: [number, number], pEnd: [number, number]): 0 | 1 {
+  const cross = (pMid[0] - pStart[0]) * (pEnd[1] - pStart[1]) - (pEnd[0] - pStart[0]) * (pMid[1] - pStart[1])
+  return cross > 0 ? 1 : 0
+}
+
+function pointOnArc(c: [number, number], r: number, deg: number): [number, number] {
+  const a = (deg * Math.PI) / 180
+  return [c[0] + r * Math.cos(a), c[1] + r * Math.sin(a)]
+}
+
+function arcPathD(to: (p: [number, number]) => [number, number], c: [number, number], r: number, startDeg: number, sweepDeg: number): string {
+  const magnitude = Math.abs(sweepDeg)
+  const p0 = to(pointOnArc(c, r, startDeg))
+  const p1 = to(pointOnArc(c, r, startDeg + sweepDeg))
+  const largeArc = magnitude > 180 ? 1 : 0
+  if (magnitude >= 359.999) {
     // ほぼ全周: 1本のarcコマンドでは始点=終点になり描画されないため2分割する
-    const mid = to([c[0] + r * Math.cos(((startDeg + sweep / 2) * Math.PI) / 180), c[1] + r * Math.sin(((startDeg + sweep / 2) * Math.PI) / 180)])
-    return `M ${p0[0]} ${p0[1]} A ${r} ${r} 0 0 1 ${mid[0]} ${mid[1]} A ${r} ${r} 0 0 1 ${p1[0]} ${p1[1]}`
+    const mid = to(pointOnArc(c, r, startDeg + sweepDeg / 2))
+    const sweepFlag = sweepFlagFromThreePoints(p0, mid, p1)
+    return `M ${p0[0]} ${p0[1]} A ${r} ${r} 0 0 ${sweepFlag} ${mid[0]} ${mid[1]} A ${r} ${r} 0 0 ${sweepFlag} ${p1[0]} ${p1[1]}`
   }
-  return `M ${p0[0]} ${p0[1]} A ${r} ${r} 0 ${largeArc} 1 ${p1[0]} ${p1[1]}`
+  const mid = to(pointOnArc(c, r, startDeg + sweepDeg / 2))
+  const sweepFlag = sweepFlagFromThreePoints(p0, mid, p1)
+  return `M ${p0[0]} ${p0[1]} A ${r} ${r} 0 ${largeArc} ${sweepFlag} ${p1[0]} ${p1[1]}`
 }
 
 function polylinePathD(to: (p: [number, number]) => [number, number], segs: PolySeg[]): string {
@@ -357,13 +419,14 @@ function polylinePathD(to: (p: [number, number]) => [number, number], segs: Poly
   parts.push(`M ${start[0]} ${start[1]}`)
   for (const seg of segs) {
     const arc = bulgeArc(seg.a, seg.b, seg.bulge)
+    const pa = to(seg.a)
     const pb = to(seg.b)
     if (arc) {
-      let sweep = arc.endDeg - arc.startDeg
-      while (sweep <= 0) sweep += 360
-      while (sweep > 360) sweep -= 360
-      const largeArc = sweep > 180 ? 1 : 0
-      parts.push(`A ${arc.r} ${arc.r} 0 ${largeArc} 1 ${pb[0]} ${pb[1]}`)
+      const magnitude = Math.abs(arc.sweepDeg)
+      const largeArc = magnitude > 180 ? 1 : 0
+      const mid = to(pointOnArc(arc.c, arc.r, arc.startDeg + arc.sweepDeg / 2))
+      const sweepFlag = sweepFlagFromThreePoints(pa, mid, pb)
+      parts.push(`A ${arc.r} ${arc.r} 0 ${largeArc} ${sweepFlag} ${pb[0]} ${pb[1]}`)
     } else {
       parts.push(`L ${pb[0]} ${pb[1]}`)
     }
@@ -386,7 +449,7 @@ function buildSvg(flat: FlatEntity[], bb: { min: [number, number]; max: [number,
       const c = to(e.c)
       lines.push(`<circle cx="${c[0]}" cy="${c[1]}" r="${e.r}" />`)
     } else if (e.type === 'arc') {
-      lines.push(`<path d="${arcPathD(to, e.c, e.r, e.startDeg, e.endDeg)}" />`)
+      lines.push(`<path d="${arcPathD(to, e.c, e.r, e.startDeg, e.sweepDeg)}" />`)
     } else if (e.type === 'polyline') {
       const segs = polySegments(e.pts, e.bulges, e.closed)
       lines.push(`<path d="${polylinePathD(to, segs)}" />`)
@@ -434,7 +497,7 @@ function collectSnaps(flat: FlatEntity[], bb: { min: [number, number]; max: [num
     } else if (e.type === 'arc') {
       add(e.c, 'center')
       const rad0 = (e.startDeg * Math.PI) / 180
-      const rad1 = (e.endDeg * Math.PI) / 180
+      const rad1 = ((e.startDeg + e.sweepDeg) * Math.PI) / 180
       add([e.c[0] + e.r * Math.cos(rad0), e.c[1] + e.r * Math.sin(rad0)], 'end')
       add([e.c[0] + e.r * Math.cos(rad1), e.c[1] + e.r * Math.sin(rad1)], 'end')
     } else if (e.type === 'polyline') {
