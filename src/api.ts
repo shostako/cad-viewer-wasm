@@ -6,13 +6,25 @@
  * この api.ts だけが唯一の継ぎ目(seam)で、main/viewer/picking/measure は
  * データ源が Python サーバか WASM かを知らずに動く。
  *
+ * OCCT-WASM(occt.ts、数百MBのヒープを確保する)は Web Worker(occt.worker.ts)
+ * に隔離し、Comlink経由のRPCで呼ぶ（UIスレッドをブロックしないため）。
+ * 3MF(threemf.ts)・DXF(dxf.ts)は軽量な純JSなのでメインスレッドのまま。
+ *
  * サイドカー(計測の永続化)は localStorage に置く（backend もサーバも不要）。
  */
 import type { MeshPack } from './meshpack'
-import { loadModel, meshPackOf, distance, faceInfo, edgeInfo, disposeAll as disposeAllOcct } from './occt'
+import * as Comlink from 'comlink'
+import type { OcctWorkerApi } from './occt.worker'
 import { load3mf, meshPackOf3mf, disposeAll as disposeAllThreeMf } from './threemf'
 import { loadDxf, svgOf, disposeAll as disposeAllDxf } from './dxf'
 import { computeVertexThickness } from './thickness'
+
+// OCCT-WASM（数百MBのヒープを確保する重いエンジン）はUIスレッドをブロック
+// しないよう Web Worker に隔離する（README記載の設計目標）。3MF/DXFの
+// パーサは軽量な純JSなのでメインスレッドのまま（occt.worker.ts参照）。
+const occtWorker = Comlink.wrap<OcctWorkerApi>(
+  new Worker(new URL('./occt.worker.ts', import.meta.url), { type: 'module' }),
+)
 
 export interface ModelMeta {
   id: string
@@ -50,17 +62,17 @@ export async function uploadModel(file: File): Promise<ModelMeta> {
   }
   if (lower.endsWith('.dxf')) {
     const meta = await loadDxf(bytes, file.name)
-    disposeAllOcct()
+    await occtWorker.disposeAll()
     disposeAllThreeMf()
     return meta
   }
   if (lower.endsWith('.3mf')) {
     const meta = await load3mf(bytes, file.name)
-    disposeAllOcct()
+    await occtWorker.disposeAll()
     disposeAllDxf()
     return meta
   }
-  const meta = await loadModel(bytes, file.name)
+  const meta = await occtWorker.loadModel(bytes, file.name)
   disposeAllThreeMf()
   disposeAllDxf()
   return meta
@@ -68,7 +80,7 @@ export async function uploadModel(file: File): Promise<ModelMeta> {
 
 export async function fetchMesh(modelId: string): Promise<MeshPack> {
   if (modelId.startsWith('t')) return meshPackOf3mf(modelId)
-  return meshPackOf(modelId)
+  return occtWorker.meshPackOf(modelId)
 }
 
 export interface EntityRef {
@@ -118,15 +130,15 @@ export async function measureDistance(modelId: string, a: EntityRef, b: EntityRe
     _stallNextMeasureMs = 0
     await new Promise((r) => setTimeout(r, ms))
   }
-  return distance(modelId, a, b)
+  return occtWorker.distance(modelId, a, b)
 }
 
 export function measureEdgeInfo(modelId: string, ref: EntityRef) {
-  return edgeInfo(modelId, ref)
+  return occtWorker.edgeInfo(modelId, ref)
 }
 
 export function measureFaceInfo(modelId: string, ref: EntityRef) {
-  return faceInfo(modelId, ref)
+  return occtWorker.faceInfo(modelId, ref)
 }
 
 /**
