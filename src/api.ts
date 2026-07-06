@@ -10,7 +10,6 @@
  */
 import type { MeshPack } from './meshpack'
 import { loadModel, meshPackOf, distance, faceInfo, edgeInfo } from './occt'
-import { load3mf, meshPackOf3mf } from './threemf'
 
 export interface ModelMeta {
   id: string
@@ -32,15 +31,10 @@ export async function fetchDrawingSvg(_modelId: string): Promise<string> {
 
 export async function uploadModel(file: File): Promise<ModelMeta> {
   const bytes = new Uint8Array(await file.arrayBuffer())
-  // 3MF は OCCT に読込手段が無いため専用の純JS経路（threemf.ts）へ分岐する。
-  // モデルIDのプレフィックス（occt.ts='m', threemf.ts='t'）で fetchMesh 側の
-  // 参照先レジストリを判定する。
-  if (file.name.toLowerCase().endsWith('.3mf')) return load3mf(bytes, file.name)
   return loadModel(bytes, file.name)
 }
 
 export async function fetchMesh(modelId: string): Promise<MeshPack> {
-  if (modelId.startsWith('t')) return meshPackOf3mf(modelId)
   return meshPackOf(modelId)
 }
 
