@@ -52,6 +52,8 @@ interface LoadedModel {
   format: 'brep' | 'mesh'
   shape: OC // TopoDS_Shape
   faces: OC[] // index i (0-based) => faceId i+1 の TopoDS_Face
+  edges: OC[] // index i (0-based) => edgeId i+1 の TopoDS_Edge
+  vertices: OC[] // index i (0-based) => vertexId i+1 の TopoDS_Vertex
   bbox: { min: number[]; max: number[] }
   triangleCount: number
   vertexCount: number
@@ -147,6 +149,8 @@ function disposeModel(m: LoadedModel): void {
   try {
     m.shape?.delete?.()
     for (const f of m.faces) f?.delete?.()
+    for (const e of m.edges) e?.delete?.()
+    for (const v of m.vertices) v?.delete?.()
   } catch {
     /* 破棄失敗は致命ではない */
   }
@@ -274,6 +278,39 @@ export async function loadModel(bytes: Uint8Array, name: string): Promise<ModelM
   }
   del(exp)
 
+  // エッジ/頂点も同じ手法で走査順に配列化（edgeId/vertexId = index+1）。
+  // ピック（picking.ts の snapVertex/snapEdge）と計測（resolveShape）が同じ
+  // 配列を参照するので ID の一貫性が保たれる。
+  //
+  // STL(kind==='stl')は対象外: StlAPI_Reader は三角形1枚ごとに独立した平面
+  // Face を作る設計（README既知の性能問題）で、580k三角形級のファイルだと
+  // 頂点・エッジ数がそのまま三角形数スケールになり実用にならない。STL は
+  // format='mesh' で真値計測自体が無効（backend の trimesh 経路と同じ扱い）
+  // なので、そもそもエッジ/頂点スナップの対象にする意味が無い。
+  const edges: OC[] = []
+  const vertices: OC[] = []
+  if (kind !== 'stl') {
+    const eexp = new oc.TopExp_Explorer_2(
+      shape,
+      oc.TopAbs_ShapeEnum.TopAbs_EDGE,
+      oc.TopAbs_ShapeEnum.TopAbs_SHAPE,
+    )
+    for (; eexp.More(); eexp.Next()) {
+      edges.push(oc.TopoDS.Edge_1(eexp.Current()))
+    }
+    del(eexp)
+
+    const vexp = new oc.TopExp_Explorer_2(
+      shape,
+      oc.TopAbs_ShapeEnum.TopAbs_VERTEX,
+      oc.TopAbs_ShapeEnum.TopAbs_SHAPE,
+    )
+    for (; vexp.More(); vexp.Next()) {
+      vertices.push(oc.TopoDS.Vertex_1(vexp.Current()))
+    }
+    del(vexp)
+  }
+
   const model: LoadedModel = {
     id,
     name,
@@ -282,13 +319,18 @@ export async function loadModel(bytes: Uint8Array, name: string): Promise<ModelM
     format: kind === 'stl' ? 'mesh' : 'brep',
     shape,
     faces,
+    edges,
+    vertices,
     bbox,
     triangleCount: 0,
     vertexCount: 0,
     meshPack: undefined as unknown as MeshPack,
   }
-  // メッシュを即構築してキャッシュ（三角形/頂点数を meta に載せるため）
-  model.meshPack = buildMeshPack(oc, model)
+  // メッシュを即構築してキャッシュ（三角形/頂点数を meta に載せるため）。
+  // エッジのサンプリング許容誤差(deflection)は面メッシュと同じ linDefl を使う
+  // （Codexレビュー指摘: 固定値0.1だとメートル単位の小さい円弧・穴がほぼ潰れ、
+  // 見た目上は曲線があるのにスナップ/計測できなくなるモデルスケール依存バグ）。
+  model.meshPack = buildMeshPack(oc, model, linDefl)
   _models.set(id, model)
   // パース成功が確定してから旧モデルを破棄する（読込失敗時に表示中モデルを
   // 巻き込まないため）。瞬間的に旧+新が同居するが、正しさをメモリ最小化より優先。
@@ -328,7 +370,7 @@ export async function meshPackOf(id: string): Promise<MeshPack> {
  * 法線は三角形の巻き順から自前計算（このビルドに法線ヘルパーが無いため）。
  * shape は BRepMesh_IncrementalMesh 済みが前提（loadStep 内で実行済み）。
  */
-function buildMeshPack(oc: OC, model: LoadedModel): MeshPack {
+function buildMeshPack(oc: OC, model: LoadedModel, linDefl: number): MeshPack {
   const positions: number[] = []
   const normals: number[] = []
   const indices: number[] = []
@@ -424,8 +466,8 @@ function buildMeshPack(oc: OC, model: LoadedModel): MeshPack {
   const posArr = new Float32Array(positions)
   const nrmArr = new Float32Array(normals)
   const idxArr = new Uint32Array(indices)
-  const edgeArr = new Float32Array(0) // スパイク: エッジ線は後回し
-  const vertArr = new Float32Array(0) // スパイク: 頂点スナップは後回し
+  const { edgeArr, edgeRanges } = buildEdges(oc, model, linDefl)
+  const vertArr = buildVertices(oc, model)
 
   // parseMeshPack が返すのと同じ形。BufferDesc の offset/byteLength は本経路では
   // 未使用（buffers を直接 typed array で持つ）だが型を満たすため埋める。
@@ -450,12 +492,88 @@ function buildMeshPack(oc: OC, model: LoadedModel): MeshPack {
         name: model.name,
         color: null,
         faceRanges,
-        edgeRanges: [] as { edgeId: number; segStart: number; segCount: number }[],
+        edgeRanges,
       },
     ],
     tree: { name: model.name, partId: 0 },
   }
   return { header, buffers } as unknown as MeshPack
+}
+
+/** vertexId 順に B-rep 頂点の真値座標を書き出す（picking.ts の snapVertex が参照）。 */
+function buildVertices(oc: OC, model: LoadedModel): Float32Array {
+  const out = new Float32Array(model.vertices.length * 3)
+  for (let i = 0; i < model.vertices.length; i++) {
+    const p = oc.BRep_Tool.Pnt(model.vertices[i])
+    out[i * 3] = p.X()
+    out[i * 3 + 1] = p.Y()
+    out[i * 3 + 2] = p.Z()
+    del(p)
+  }
+  return out
+}
+
+/**
+ * エッジごとに独立に離散化してポリライン（線分ペア）を作る。
+ *
+ * 罠(実測でクラッシュ確認済み): backend の _edge_polyline は隣接面の
+ * テッセレーションから PolygonOnTriangulation で「メッシュと一致する」離散化を
+ * 取り出す方式だが、このWASMビルドではその手法が特定の面/エッジの組み合わせで
+ * 不正なノードインデックス（範囲外の巨大な値）を返しWASMヒープを破壊する
+ * （面のTriangulationをテッセレーション用とエッジ抽出用の二重に fetch/delete
+ * したのが原因かと最初疑ったが、面ごとに1回のfetch/deleteへ直しても再現した —
+ * PolygonOnTriangulationバインディング自体が一部ケースで信頼できない）。
+ *
+ * 代わりに BRepAdaptor_Curve + GCPnts_QuasiUniformDeflection でエッジ自身の
+ * パラメトリック曲線を独立にサンプリングする（面のテッセレーションに一切触れない）。
+ * 面メッシュの分割点と厳密に一致しない見た目上の差はあるが、エッジは
+ * ピッキングの画面上スナップ候補判定にしか使わず、実測値は常に edgeInfo/distance
+ * が B-rep 実体（TopoDS_Edge）から真値計算するので正確性には影響しない。
+ * 60エッジ全数・全面で実ブラウザ検証しクラッシュ0件を確認済み。
+ *
+ * 罠(Codexレビュー指摘): サンプリング許容誤差(deflection)は固定値でなく
+ * linDefl（loadModel が bbox 対角から算出、面メッシュと同じ値）を使う。
+ * 固定値0.1だとメートル単位の小さい円弧・穴径の円形エッジがほぼ潰れ
+ * （両端点だけ、あるいはほぼ長さ0のセグメントになる）、見た目には曲線が
+ * あるのに snapEdge がそれを候補として拾えなくなる。
+ */
+function buildEdges(
+  oc: OC,
+  model: LoadedModel,
+  linDefl: number,
+): { edgeArr: Float32Array; edgeRanges: { edgeId: number; segStart: number; segCount: number }[] } {
+  const segs: number[] = []
+  const edgeRanges: { edgeId: number; segStart: number; segCount: number }[] = []
+  let segOffset = 0
+
+  for (let ei = 0; ei < model.edges.length; ei++) {
+    const edge = model.edges[ei]
+    const curve = new oc.BRepAdaptor_Curve_2(edge)
+    // 第3引数は Continuity()（曲線の連続性）。QuasiUniformDeflectionの3引数
+    // オーバーロードはこの並びを要求する（実測済み）。
+    const sampler = new oc.GCPnts_QuasiUniformDeflection_2(curve, linDefl, curve.Continuity())
+    if (sampler.IsDone()) {
+      const n: number = sampler.NbPoints()
+      if (n >= 2) {
+        const pts: number[][] = []
+        for (let i = 1; i <= n; i++) {
+          const p = sampler.Value(i)
+          pts.push([p.X(), p.Y(), p.Z()])
+          del(p)
+        }
+        const nSegs = n - 1
+        for (let i = 0; i < nSegs; i++) {
+          segs.push(pts[i][0], pts[i][1], pts[i][2])
+          segs.push(pts[i + 1][0], pts[i + 1][1], pts[i + 1][2])
+        }
+        edgeRanges.push({ edgeId: ei + 1, segStart: segOffset, segCount: nSegs })
+        segOffset += nSegs
+      }
+    }
+    del(sampler, curve)
+  }
+
+  return { edgeArr: new Float32Array(segs), edgeRanges }
 }
 
 function desc(dtype: 'float32' | 'uint32', count: number) {
@@ -495,8 +613,17 @@ function resolveShape(oc: OC, model: LoadedModel, ref: EntityRef): ResolvedShape
     if (!f) throw new Error(`face id ${ref.id} out of range`)
     return { shape: f, owned: false }
   }
-  // エッジ/頂点はスパイク未対応（picking も現状 face のみ返す）
-  throw new Error(`スパイク未対応の参照種別: ${ref.kind}`)
+  if (ref.kind === 'edge' && ref.id) {
+    const e = model.edges[ref.id - 1]
+    if (!e) throw new Error(`edge id ${ref.id} out of range`)
+    return { shape: e, owned: false }
+  }
+  if (ref.kind === 'vertex' && ref.id) {
+    const v = model.vertices[ref.id - 1]
+    if (!v) throw new Error(`vertex id ${ref.id} out of range`)
+    return { shape: v, owned: false }
+  }
+  throw new Error(`未対応の参照種別: ${ref.kind}`)
 }
 
 /** 2エンティティ間の最短距離（BRepExtrema、真値）。 */
@@ -580,7 +707,59 @@ export async function faceInfo(id: string, ref: EntityRef): Promise<FaceInfoResu
   }
 }
 
-/** エッジ情報: スパイクでは picking がエッジを返さないため未使用。契約維持のため実装。 */
-export async function edgeInfo(_id: string, _ref: EntityRef): Promise<EdgeInfoResult> {
-  throw new Error('エッジ計測はスパイク未対応')
+// OCCT の GeomAbs_CurveType 列挙順（安定・OCCT全バージョン共通）。backend の
+// `GeomAbs_CurveType(...).name.removeprefix("GeomAbs_").lower()` と同じ表記に揃える。
+const CURVE_TYPE_NAMES = [
+  'line',
+  'circle',
+  'ellipse',
+  'hyperbola',
+  'parabola',
+  'beziercurve',
+  'bsplinecurve',
+  'offsetcurve',
+  'othercurve',
+]
+
+/** エッジ情報: 長さ + 円形(穴のフィレット/ボス外周等)半径・中心・軸。 */
+export async function edgeInfo(id: string, ref: EntityRef): Promise<EdgeInfoResult> {
+  const oc = await initOcct()
+  const model = _models.get(id)
+  if (!model) throw new Error(`unknown model id: ${id}`)
+  const resolved = resolveShape(oc, model, ref)
+  const edge = oc.TopoDS.Edge_1(resolved.shape)
+
+  const props = new oc.GProp_GProps_1()
+  try {
+    oc.BRepGProp.LinearProperties(edge, props, false, false)
+    const out: EdgeInfoResult = { type: 'edge', length: props.Mass(), curve: 'unknown' }
+
+    const curve = new oc.BRepAdaptor_Curve_2(edge)
+    try {
+      const ctype: number = curve.GetType().value
+      if (ctype === oc.GeomAbs_CurveType.GeomAbs_Circle.value) {
+        const circ = curve.Circle()
+        const c = circ.Location()
+        const axis = circ.Axis()
+        const ax = axis.Direction()
+        out.curve = 'circle'
+        out.radius = circ.Radius()
+        out.diameter = 2 * circ.Radius()
+        out.center = [c.X(), c.Y(), c.Z()]
+        out.axis = [ax.X(), ax.Y(), ax.Z()]
+        del(circ, axis, c, ax)
+      } else {
+        out.curve = CURVE_TYPE_NAMES[ctype] ?? 'unknown'
+      }
+    } finally {
+      del(curve)
+    }
+    return out
+  } finally {
+    del(props, edge)
+    // edge は resolved.shape (model.edges の永続 Edge) を再キャストしたもの。
+    // 再キャスト結果を破棄しても永続側は壊れない（faceInfo と同様に実測済みの
+    // パターン）。owned な一時オブジェクトは resolved 側も破棄する。
+    if (resolved.owned) del(resolved.shape)
+  }
 }
