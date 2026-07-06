@@ -52,7 +52,34 @@ export function __stallNextLoad(ms: number): Promise<void> {
   return occtWorker.__stallNextLoad(ms)
 }
 
+// Codexレビュー指摘(P1×2): occt.ts内の_loadGenは「同じローダー内」のレース
+// (STEP同士等)しか見ておらず、フォーマットを跨いだ切替（3MF→STEP、STEP→3MF等）
+// のstale完了には無防備だった。例: 3MFアップロードが後発のSTEPアップロードに
+// supersededされても、staleな3MF側のuploadModelはload3mf完了後にレジューム
+// して occtWorker.disposeAll() を呼んでしまい、既に表示されている新しいSTEP
+// モデルをWorker側から消してしまう（逆方向＝staleなSTEPがdisposeAllThreeMf()
+// を呼んで現在の3MFを消すケースも同様）。main.tsのloadGenと同じ考え方で、
+// api.ts側にも独自の世代カウンタを持ち、「自分より新しいuploadModel呼び出しが
+// 始まっていたら、他フォーマットの破棄をスキップする」よう直列化する。
+let _uploadGen = 0
+
+// test-only: 次のuploadModel呼び出しについて、gen採番の直後・実際のパース
+// 処理の前に人為的な遅延を入れる。「先に始まった呼び出しが後発より遅く
+// 完了する」フォーマット跨ぎのレースを実ブラウザで決定的に再現するための
+// フック（occt.tsの__stallNextLoadと同じ流儀。delay採番の"後"に置くのが
+// 肝心 — 先に置くと遅延させた呼び出しが逆に"新しい"gen扱いになってしまう）。
+let _stallNextUploadMs = 0
+export function __stallNextUpload(ms: number): void {
+  _stallNextUploadMs = ms
+}
+
 export async function uploadModel(file: File): Promise<ModelMeta> {
+  const gen = ++_uploadGen
+  if (_stallNextUploadMs > 0) {
+    const ms = _stallNextUploadMs
+    _stallNextUploadMs = 0
+    await new Promise((r) => setTimeout(r, ms))
+  }
   const bytes = new Uint8Array(await file.arrayBuffer())
   const lower = file.name.toLowerCase()
   // 3MF/DXF は OCCT に読込手段が無い（3MF）か WASM化不可（DWG、DXFのみ純JSで
@@ -71,25 +98,31 @@ export async function uploadModel(file: File): Promise<ModelMeta> {
   }
   if (lower.endsWith('.dxf')) {
     const meta = await loadDxf(bytes, file.name)
-    // Codexレビュー指摘: occtWorker.disposeAll()をawaitすると、OCCT Workerが
-    // 大きいSTEP/STLの重い同期パース中はそのRPCがキューの後ろで詰まり、
-    // 既にパース完了しているDXF/3MFの表示までブロックされてしまう
-    // （Worker化でUIスレッドは守れても、Worker自体がビジーだと「切替」操作が
-    // 巻き込まれる）。破棄はメモリ解放のみが目的で戻り値のmetaに影響しない
-    // ため、待たずに投げっぱなしにする。
-    void occtWorker.disposeAll().catch(() => {})
-    disposeAllThreeMf()
+    if (gen === _uploadGen) {
+      // Codexレビュー指摘: occtWorker.disposeAll()をawaitすると、OCCT Workerが
+      // 大きいSTEP/STLの重い同期パース中はそのRPCがキューの後ろで詰まり、
+      // 既にパース完了しているDXF/3MFの表示までブロックされてしまう
+      // （Worker化でUIスレッドは守れても、Worker自体がビジーだと「切替」操作が
+      // 巻き込まれる）。破棄はメモリ解放のみが目的で戻り値のmetaに影響しない
+      // ため、待たずに投げっぱなしにする。
+      void occtWorker.disposeAll().catch(() => {})
+      disposeAllThreeMf()
+    }
     return meta
   }
   if (lower.endsWith('.3mf')) {
     const meta = await load3mf(bytes, file.name)
-    void occtWorker.disposeAll().catch(() => {})
-    disposeAllDxf()
+    if (gen === _uploadGen) {
+      void occtWorker.disposeAll().catch(() => {})
+      disposeAllDxf()
+    }
     return meta
   }
   const meta = await occtWorker.loadModel(bytes, file.name)
-  disposeAllThreeMf()
-  disposeAllDxf()
+  if (gen === _uploadGen) {
+    disposeAllThreeMf()
+    disposeAllDxf()
+  }
   return meta
 }
 

@@ -332,6 +332,24 @@ evict/コミット時のevictをスキップする」よう修正（例外は投
 （`fetchMesh`が期待通り失敗すること）、OCCT側を人為的に遅延させても
 DXFへの切替が待たされず完了することを確認した。
 
+**罠（Codexレビュー指摘、実測で確認・修正済み、P1×2）**: `occt.ts`内の
+`_loadGen`は「同じローダー内」のレース（STEP同士等）しか見ておらず、
+フォーマットを跨いだ切替（3MF→STEP、STEP→3MF等）のstale完了には無防備
+だった。例: 3MFアップロードが後発のSTEPアップロードにsupersededされても、
+staleな3MF側の`uploadModel`は`load3mf`完了後にレジュームして
+`occtWorker.disposeAll()`を呼んでしまい、既に表示されている新しいSTEP
+モデルをWorker側から消してしまう（逆方向＝staleなSTEPが
+`disposeAllThreeMf()`を呼んで現在の3MFを消すケースも同様）。`main.ts`の
+`loadGen`と同じ考え方で、`api.ts`側にも独自の世代カウンタ（`_uploadGen`）
+を持たせ、「自分より新しい`uploadModel`呼び出しが完了していたら他
+フォーマットの破棄をスキップする」よう修正。
+
+実ブラウザで、意図的なテストフック（`__stallNextUpload`、gen採番後に人為的な
+遅延を入れる — occt.tsの`__stallNextLoad`と同じ流儀）を使い、3MF→STEP・
+STEP→3MFの両方向で「先発が後発より遅く完了する」状況を決定的に再現。
+修正前は両方向とも現在のモデルが巻き込まれて`unknown model id`で失敗する
+ことを確認し、修正後は両方向とも失敗しなくなることを確認した。
+
 ## 開発
 
 ```bash
