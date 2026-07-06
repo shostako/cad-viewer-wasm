@@ -332,17 +332,31 @@ function flattenOne(e: IEntity, blocks: Record<string, IBlock>, layers: Record<s
       const local: Xform = { ...IDENTITY, dx: -bx, dy: -by }
       // ie.rotationは度（INSERTのDXFグループコード50は度、ARCのラジアンとは
       // 単位が異なることを実測で確認済み — 単位を思い込まず個別に検証した）。
-      const placement: Xform = xformFromRotScale(ie.position.x, ie.position.y, ie.rotation || 0, ie.xScale ?? 1, ie.yScale ?? 1)
-      const inner = composeXform(placement, local)
-      const combined = composeXform(x, inner)
+      const rotDeg = ie.rotation || 0
       const cols = Math.max(1, ie.columnCount || 1)
       const rows = Math.max(1, ie.rowCount || 1)
       const colSp = ie.columnSpacing || 0
       const rowSp = ie.rowSpacing || 0
+      // Codexレビュー指摘(P2): MINSERT(columnCount/rowCount)の行/列間隔は
+      // 「挿入基点間の距離」であり、DXF仕様上ブロックのxScale/yScaleは掛からず
+      // 回転だけが影響する。以前の実装はarrayOffset(平行移動のみ)をcombined
+      // (スケール込みの合成変換)の内側に合成していたため、spacingにまで
+      // xScale/yScaleが誤って掛かっていた。回転のみのXformでoffsetを変換して
+      // からINSERTのposition(平行移動)に加算することで、スケールの影響を
+      // 受けずに回転だけ反映させる。
+      const rotationOnly: Xform = xformFromRotScale(0, 0, rotDeg, 1, 1)
       for (let row = 0; row < rows; row++) {
         for (let col = 0; col < cols; col++) {
-          const arrayOffset: Xform = { ...IDENTITY, dx: col * colSp, dy: row * rowSp }
-          const withArray = composeXform(combined, arrayOffset)
+          const [offX, offY] = applyXform(rotationOnly, [col * colSp, row * rowSp])
+          const placement: Xform = xformFromRotScale(
+            ie.position.x + offX,
+            ie.position.y + offY,
+            rotDeg,
+            ie.xScale ?? 1,
+            ie.yScale ?? 1,
+          )
+          const inner = composeXform(placement, local)
+          const withArray = composeXform(x, inner)
           flattenEntities(block.entities ?? [], blocks, layers, withArray, depth + 1, out)
         }
       }
