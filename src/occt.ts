@@ -58,6 +58,14 @@ interface LoadedModel {
   triangleCount: number
   vertexCount: number
   meshPack: MeshPack // load時に構築してキャッシュ
+  // Codexレビュー指摘(P2、7巡目)を受けた恒久対策: このidを最後に「claim」した
+  // api.ts側の呼び出しのgen（api.tsの_uploadGen、uploadModel呼び出しごとに採番、
+  // フォーマット跨ぎで単調増加）。新規コミット時・cache-hit時の両方でこの値を
+  // max()更新することで、「誰が最後にこのidを見たか」を id 単位で追跡する。
+  // disposeByIdはこの値と呼び出し側の主張するgenが一致する時だけ実際に破棄する
+  // （＝自分より新しい誰かが既にこのidを見ていたら、たとえ自分がstaleでも
+  // 手を出さない）。詳細は disposeById のコメント参照。
+  claimGen: number
 }
 
 const _models = new Map<string, LoadedModel>()
@@ -150,10 +158,25 @@ export function disposeAll(): void {
  * が呼ばれるまでWASMヒープに残り続ける。disposeAll()で一括破棄すると、
  * その後に本当に始まった正当な新しいOCCT読込まで巻き込みかねないため、
  * api.ts側が「このIDだけ」を指定して確実に破棄できる手段を用意する。
+ *
+ * Codexレビュー指摘(P2、7巡目、恒久対策): 上記のdisposeByIdは呼び出し元が
+ * stale判定した時点で無条件に(あるいはcache-hitかどうかだけで)破棄していたが、
+ * それでも「破棄しようとしているid」を、自分より新しい別の呼び出しが既に
+ * cache-hitで参照・依拠している可能性を見落とす（例: 同一ファイルへの
+ * ほぼ同時アップロードで、先発が新規コミット(cached:false)した直後に後発が
+ * cache-hitでそのidを引き継ぎ「現在」になったのに、先発が自分をstaleと気付き
+ * 無条件にdisposeByIdしてしまうと、後発が今まさに使っているモデルを消して
+ * しまう）。id単位で「最後にこのidを見た呼び出しのgen」(claimGen、api.ts
+ * 側の_uploadGenを渡してもらう)をLoadedModelに持たせ、disposeByIdは
+ * 「呼び出し時点でもclaimGenが自分のgenのままである(＝自分より新しい誰も
+ * このidに触れていない)」場合だけ実際に破棄する。呼び出し元は自分のgenを
+ * 渡すだけでよく、cache-hitかどうかを気にする必要が無くなる（安全性は
+ * このid単位のclaimGen比較だけで担保される）。
  */
-export function disposeById(id: string): void {
+export function disposeById(id: string, gen: number): void {
   const m = _models.get(id)
   if (!m) return
+  if (m.claimGen !== gen) return // 自分より新しい誰かが既にこのidを見ている
   disposeModel(m)
   _models.delete(id)
 }
@@ -267,8 +290,16 @@ function readStlShape(oc: OC, bytes: Uint8Array): OC {
   }
 }
 
-/** モデルファイルを読み、shape と面配列を格納して ModelMeta を返す。 */
-export async function loadModel(bytes: Uint8Array, name: string): Promise<ModelMeta> {
+/**
+ * モデルファイルを読み、shape と面配列を格納して ModelMeta を返す。
+ *
+ * @param apiGen api.ts側の_uploadGen（uploadModel呼び出しごとに採番、フォーマット
+ *   跨ぎで単調増加する値）。disposeByIdのid単位claimGen追跡に使うためだけの値で、
+ *   occt.ts自身の同一ローダー内レース制御（_loadGen、下記gen）とは独立。
+ *   呼び出し元(api.ts)は自分がstaleと分かった時、この同じ値をdisposeByIdへ
+ *   渡すことで「自分が最後にこのidを見た張本人の場合だけ」安全に破棄できる。
+ */
+export async function loadModel(bytes: Uint8Array, name: string, apiGen: number): Promise<ModelMeta> {
   const gen = ++_loadGen
   if (_stallNextLoadMs > 0) {
     const ms = _stallNextLoadMs
@@ -291,6 +322,12 @@ export async function loadModel(bytes: Uint8Array, name: string): Promise<ModelM
     // 自分の開始後により新しい読込が始まっていたら、evictを行わない
     // （現在のモデルを巻き込んで消す事故を防ぐ）。
     if (gen === _loadGen) evictOthers(id)
+    // claimGenは「このidを最後に見た呼び出し」を単調増加のapiGenで記録する。
+    // cache-hitの自分がstaleな古い呼び出しである可能性もあるため、
+    // 常に更新するのではなく「自分の方が新しい場合だけ」更新する
+    // （古いcache-hitが新しいclaimGenを巻き戻して壊すと、後から来る本当の
+    // 新しい呼び出しのdisposeById安全判定が誤って通ってしまう）。
+    if (apiGen > cached.claimGen) cached.claimGen = apiGen
     return metaOf(cached, true)
   }
   // 注意: eviction は「新モデルのパース成功後」に行う（下部）。パース前に消すと、
@@ -377,6 +414,7 @@ export async function loadModel(bytes: Uint8Array, name: string): Promise<ModelM
     triangleCount: 0,
     vertexCount: 0,
     meshPack: undefined as unknown as MeshPack,
+    claimGen: apiGen,
   }
   // メッシュを即構築してキャッシュ（三角形/頂点数を meta に載せるため）。
   // エッジのサンプリング許容誤差(deflection)は面メッシュと同じ linDefl を使う

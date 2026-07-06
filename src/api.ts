@@ -118,11 +118,11 @@ export async function uploadModel(file: File): Promise<ModelMeta> {
     }
     return meta
   }
-  const meta = await occtWorker.loadModel(bytes, file.name)
+  const meta = await occtWorker.loadModel(bytes, file.name, gen)
   if (gen === _uploadGen) {
     disposeAllThreeMf()
     disposeAllDxf()
-  } else if (!meta.cached) {
+  } else {
     // Codexレビュー指摘: occt.ts内の_loadGenは「同じOCCTローダー内」のレース
     // しか見ていない。このSTEP/IGES/STL読込がinitOcct()/contentHash()で
     // await中に3MF/DXFへの切替(このgen !== _uploadGen)が発生してsuperseded
@@ -132,16 +132,17 @@ export async function uploadModel(file: File): Promise<ModelMeta> {
     // 残り続ける。disposeAll()は他の正当な現在モデルを巻き込む恐れがある
     // ため使わず、このIDだけを指定して確実に破棄する。
     //
-    // Codexレビュー指摘(6巡目、P2): 上記のdisposeByIdは「このアップロード
-    // 呼び出しがloadModel内で新規にパース・コミットしたモデル」だけを対象に
-    // すべき。meta.cachedがtrue(occt.ts側でcontentHashが既存モデルとヒットし、
-    // 新規パース・コミットを一切せずに既存モデルをそのまま返した場合)は、その
-    // idは自分専用の孤児ではなく他の呼び出し（現在表示中のものかもしれない）
-    // と共有されている可能性があるため、disposeByIdしてはいけない
-    // （実ブラウザで「同一ファイルの再アップロードが、進行中の別アップロード
-    // にsupersededされ、cache-hitで現在表示中のモデルと同じidを返すケース」
-    // を再現し、このガード無しだと表示中モデルが消えることを確認した）。
-    void occtWorker.disposeById(meta.id).catch(() => {})
+    // Codexレビュー指摘(6巡目→7巡目、P2×2、恒久対策): 「cache-hitかどうか」
+    // (meta.cached)だけで判定すると、同一ファイルのほぼ同時アップロードで
+    // 自分(先発)が新規コミット(cached:false)した直後に後発がcache-hitで
+    // 同じidを引き継いで「現在」になるケースを見落とす — 自分がstaleと
+    // 気付いた時にはもう後発が依拠しているので、無条件disposeByIdは危険。
+    // 逆に「cache-hitなら常にスキップ」も別の巻き込み事故を防げない。
+    // 安全性の判断はocct.ts側のid単位claimGen比較に一本化し、api.tsは
+    // 自分のgenを渡すだけにする（disposeByIdは「自分より新しい誰かが既に
+    // このidを見ていたら何もしない」ため、cached/fresh を問わず常に呼んで
+    // 安全 — occt.ts の disposeById 実装コメント参照）。
+    void occtWorker.disposeById(meta.id, gen).catch(() => {})
   }
   return meta
 }
