@@ -380,6 +380,13 @@ function buildMeshPack(oc: OC, model: LoadedModel, linDefl: number): MeshPack {
 
   for (let fi = 0; fi < model.faces.length; fi++) {
     const face = model.faces[fi]
+    // Codexレビュー指摘(P1): 三角形分割(BRep_Tool.Triangulation)は面の下地
+    // サーフェスに対して固定の巻き順で格納されており、TopAbs_REVERSED な面
+    // （STEP/IGESのブーリアン演算後には普通に存在する）では実際の外向き法線が
+    // 巻き順から計算した法線と逆になる。実ブラウザ確認(mini_mold.step)で
+    // 隣接面がFORWARD/REVERSED混在している実例を確認済み（.value: 0=FORWARD,
+    // 1=REVERSED、他の enum 比較と同じ .value パターン）。
+    const reversed = face.Orientation_1().value === oc.TopAbs_Orientation.TopAbs_REVERSED.value
     const loc = new oc.TopLoc_Location_1()
     const triHandle = oc.BRep_Tool.Triangulation(face, loc)
     if (triHandle.IsNull()) {
@@ -419,8 +426,13 @@ function buildMeshPack(oc: OC, model: LoadedModel, linDefl: number): MeshPack {
     for (let i = 1; i <= nTris; i++) {
       const t = tri.Triangle(i)
       const a = t.Value(1) - 1
-      const b = t.Value(2) - 1
-      const c = t.Value(3) - 1
+      // TopAbs_REVERSED な面は三角形分割の巻き順を下地サーフェス基準のまま
+      // 保持しているため、b/cを入れ替えて実際の外向き（ソリッド外側）の
+      // 巻き順に揃える。法線もこの巻き順から計算するので自動的に正しい
+      // 向きになる（法線だけ反転して巻き順を放置すると、描画・ピック側で
+      // 参照する三角形の表裏と法線の向きが食い違ったままになる）。
+      const b = reversed ? t.Value(3) - 1 : t.Value(2) - 1
+      const c = reversed ? t.Value(2) - 1 : t.Value(3) - 1
       del(t)
       faceTris.push([a, b, c])
       // 面法線（外積）を3頂点に加算（面内スムーズ法線）

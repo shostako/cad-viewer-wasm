@@ -11,6 +11,7 @@
 import type { MeshPack } from './meshpack'
 import { loadModel, meshPackOf, distance, faceInfo, edgeInfo, disposeAll as disposeAllOcct } from './occt'
 import { load3mf, meshPackOf3mf, disposeAll as disposeAllThreeMf } from './threemf'
+import { computeVertexThickness } from './thickness'
 
 export interface ModelMeta {
   id: string
@@ -114,12 +115,28 @@ export function measureFaceInfo(modelId: string, ref: EntityRef) {
   return faceInfo(modelId, ref)
 }
 
-/** 肉厚: WASM移植の後段（three-mesh-bvh でレイ法を移す予定）。スパイクでは未対応。 */
+/**
+ * 肉厚チェック。表示メッシュ（MeshPack の positions/normals/indices）に対して
+ * three-mesh-bvh でレイ法/ローリングボール法を計算する（backend/thickness.py
+ * のtrimesh実装と同じアルゴリズム、詳細は thickness.ts 参照）。B-repではなく
+ * 表示メッシュを見るため、STEP/IGES(brep)・STL/3MF(mesh) いずれでも同じ経路で動く。
+ * 現状パートは常に単一(id=0)だが、将来のアセンブリ対応（XCAF、現状は保留中）に
+ * 備えて header.parts を汎用的に走査する。
+ */
 export async function fetchThickness(
-  _modelId: string,
-  _method: 'ray' | 'ball' = 'ray',
+  modelId: string,
+  method: 'ray' | 'ball' = 'ray',
 ): Promise<Map<number, Float32Array>> {
-  throw new Error('肉厚チェックはこのビルドでは未対応')
+  const pack = await fetchMesh(modelId)
+  const out = new Map<number, Float32Array>()
+  for (const part of pack.header.parts as { id: number }[]) {
+    const positions = pack.buffers[`p${part.id}:positions`] as Float32Array | undefined
+    const normals = pack.buffers[`p${part.id}:normals`] as Float32Array | undefined
+    const indices = pack.buffers[`p${part.id}:indices`] as Uint32Array | undefined
+    if (!positions || !normals || !indices) continue
+    out.set(part.id, computeVertexThickness(positions, normals, indices, method))
+  }
+  return out
 }
 
 // --- サイドカー永続化: localStorage ---------------------------------------
