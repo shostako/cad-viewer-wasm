@@ -1,12 +1,20 @@
 /**
- * OCCT-WASM エンジン（backend/app/tessellation.py + measure.py のブラウザ移植・スパイク版）。
+ * OCCT-WASM エンジン（backend/app/tessellation.py + measure.py のブラウザ移植）。
  *
  * 設計原則は本家と同一 —「メッシュは表示用の嘘、計測はB-repの真実」。
  * テッセレーションした三角形には由来する faceId を付け、計測は必ず元の
  * B-rep（TopoDS_Face）に対して BRepExtrema / GProp で真値を出す。
  *
- * スパイク範囲: STEPControl_Reader（非XCAF・単一シェイプ）。面のみ。
- * アセンブリ展開・色・名前・エッジ/頂点スナップ・IGES は本移植で追加する。
+ * 対応形式:
+ *   - STEP/IGES: STEPControl_Reader / IGESControl_Reader（非XCAF・単一シェイプ、面のみ）。
+ *     どちらも XSControl_Reader 系の同一インターフェース
+ *     （ReadFile → NbRootsForTransfer → TransferRoots → OneShape）を共有する。
+ *   - STL: StlAPI_Reader。パラメトリック面を持たないため format は 'mesh' 扱いとし、
+ *     本家 backend（trimesh 経由・B-rep計測なし）と挙動を揃えて計測を無効化する。
+ *     3MF/OBJ/PLY は OCCT に読込手段が無く（本家も trimesh 任せで OCCT を通さない）、
+ *     別途 JS 側パーサが必要 — 本ビルドは未対応。
+ *
+ * 未対応: アセンブリ展開・色・名前、エッジ/頂点スナップ、2D図面。
  * このビルドに TopTools_IndexedMapOfShape が無いため、面インデックスは
  * TopExp_Explorer の走査順で JS 側に自前保持する（テッセレーションと計測解決で
  * 同一配列を使うので faceId は一貫する）。
@@ -41,6 +49,7 @@ export function initOcct(): Promise<OC> {
 interface LoadedModel {
   id: string
   name: string
+  format: 'brep' | 'mesh'
   shape: OC // TopoDS_Shape
   faces: OC[] // index i (0-based) => faceId i+1 の TopoDS_Face
   bbox: { min: number[]; max: number[] }
@@ -51,10 +60,17 @@ interface LoadedModel {
 
 const _models = new Map<string, LoadedModel>()
 
-function extToRoute(name: string): 'brep' | 'unsupported' {
+type Kind = 'step' | 'iges' | 'stl' | 'unsupported'
+
+function classify(name: string): Kind {
   const ext = name.toLowerCase().split('.').pop() ?? ''
-  return ext === 'step' || ext === 'stp' ? 'brep' : 'unsupported'
+  if (ext === 'step' || ext === 'stp') return 'step'
+  if (ext === 'iges' || ext === 'igs') return 'iges'
+  if (ext === 'stl') return 'stl'
+  return 'unsupported'
 }
+
+const SUPPORTED_HINT = 'このビルドの対応形式: STEP(.step/.stp) / IGES(.iges/.igs) / STL(.stl)'
 
 /** ファイル内容の SHA-256 先頭16バイトを hex で返す（モデルID＝サイドカーキーの安定化）。 */
 async function contentHash(bytes: Uint8Array): Promise<string> {
@@ -68,7 +84,7 @@ function metaOf(model: LoadedModel): ModelMeta {
   return {
     id: model.id,
     name: model.name,
-    format: 'brep',
+    format: model.format,
     vertexCount: model.vertexCount,
     triangleCount: model.triangleCount,
     partCount: 1,
@@ -85,6 +101,17 @@ function evictOthers(keepId: string): void {
   }
 }
 
+/**
+ * 全モデルを破棄する。3MF等 OCCT を経由しない他形式ローダーへ切り替わった際に
+ * api.ts から呼ばれる（Codexレビュー指摘: 切替を跨いで前の形式の WASM 形状が
+ * 破棄されず残り続けるとヒープを圧迫する）。embind オブジェクトは GC されない
+ * ため、Mapをクリアするだけでは漏れる — disposeModel を必ず経由する。
+ */
+export function disposeAll(): void {
+  for (const m of _models.values()) disposeModel(m)
+  _models.clear()
+}
+
 function disposeModel(m: LoadedModel): void {
   // embind オブジェクトは GC されない。明示 delete で WASM ヒープを返す。
   try {
@@ -95,11 +122,69 @@ function disposeModel(m: LoadedModel): void {
   }
 }
 
-/** STEP バイト列を読み、shape と面配列を格納して ModelMeta を返す。 */
-export async function loadStep(bytes: Uint8Array, name: string): Promise<ModelMeta> {
+// 仮想FSパスの罠: 「ベース名が長い」と STEPControl_Reader/IGESControl_Reader の
+// ReadFile が 0 roots を返す。実測(同一バイト)では:
+//   /b /x /a /m .step (1文字) → 成功 / /model /input /model2 .step → 失敗
+// FS 内容は byte 一致で検証済みなのに名前長で挙動が変わる。embind/OCCT の
+// ファイル名マーシャリングに fixed-size バッファ overflow 系のバグがある。
+// 短いベース名なら確実に回避できるので拡張子ごとに固定パスを使う。
+const VPATH: Record<'step' | 'iges' | 'stl', string> = {
+  step: '/m.step',
+  iges: '/m.igs',
+  stl: '/m.stl',
+}
+
+/** STEP/IGES を XSControl_Reader 系の共通インターフェースで読み、shapeを返す。 */
+function readXsShape(oc: OC, kind: 'step' | 'iges', bytes: Uint8Array): OC {
+  const virtualPath = VPATH[kind]
+  try {
+    oc.FS.unlink(virtualPath)
+  } catch {
+    /* 初回は存在しない */
+  }
+  // 罠: createDataFile の canOwn=true は使うな。ブラウザ由来の Uint8Array の
+  // バッファ所有権を emscripten が奪い、OCCT が読む時点でデータが化けて
+  // ReadFile が RetError になる（Node では顕在化しない）。FS.writeFile は必ず
+  // コピーするので安全。
+  oc.FS.writeFile(virtualPath, bytes)
+  const reader = kind === 'step' ? new oc.STEPControl_Reader_1() : new oc.IGESControl_Reader_1()
+  reader.ReadFile(virtualPath)
+  const nRoots = reader.NbRootsForTransfer()
+  oc.FS.unlink(virtualPath)
+  // ReadFile が返す IFSelect_ReturnStatus 列挙は embind 上で値比較が当てにならない
+  // （RetDone との一致が取れない）。成否は「転送可能ルート数」で判定する。
+  if (nRoots < 1) {
+    throw new Error(`${kind.toUpperCase()}読込失敗（ファイル破損・非対応、または転送ルート無し）`)
+  }
+  reader.TransferRoots()
+  const shape = reader.OneShape()
+  if (shape.IsNull()) throw new Error(`${kind.toUpperCase()}: 形状が空`)
+  return shape
+}
+
+/** STL を StlAPI_Reader で読む。パラメトリック面を持たないテッセレーション済み形状。 */
+function readStlShape(oc: OC, bytes: Uint8Array): OC {
+  const virtualPath = VPATH.stl
+  try {
+    oc.FS.unlink(virtualPath)
+  } catch {
+    /* 初回は存在しない */
+  }
+  oc.FS.writeFile(virtualPath, bytes)
+  const shape = new oc.TopoDS_Shape()
+  const reader = new oc.StlAPI_Reader()
+  const ok = reader.Read(shape, virtualPath)
+  oc.FS.unlink(virtualPath)
+  if (!ok || shape.IsNull()) throw new Error('STL読込失敗（ファイル破損・非対応）')
+  return shape
+}
+
+/** モデルファイルを読み、shape と面配列を格納して ModelMeta を返す。 */
+export async function loadModel(bytes: Uint8Array, name: string): Promise<ModelMeta> {
   const oc = await initOcct()
-  if (extToRoute(name) !== 'brep') {
-    throw new Error(`スパイクは STEP のみ対応（.step/.stp）: ${name}`)
+  const kind = classify(name)
+  if (kind === 'unsupported') {
+    throw new Error(`未対応の形式です: ${name}\n${SUPPORTED_HINT}`)
   }
 
   // モデルID＝ファイル内容ハッシュ。アップロード順ではなくファイルに紐付くので
@@ -113,42 +198,18 @@ export async function loadStep(bytes: Uint8Array, name: string): Promise<ModelMe
     return metaOf(cached)
   }
   // 注意: eviction は「新モデルのパース成功後」に行う（下部）。パース前に消すと、
-  // 壊れた STEP で読込失敗した際に表示中の旧モデルまで _models から消え、
+  // 壊れた入力で読込失敗した際に表示中の旧モデルまで _models から消え、
   // 画面に残った旧ジオメトリへのピック/計測が unknown model id で死ぬ。
 
-  // emscripten 仮想FSへ書き込み → STEP読込。
-  //
-  // 罠その1: createDataFile の canOwn=true は使うな。ブラウザ由来の Uint8Array の
-  //   バッファ所有権を emscripten が奪い、OCCT が読む時点でデータが化けて
-  //   ReadFile が RetError になる（Node では顕在化しない）。FS.writeFile は必ず
-  //   コピーするので安全。
-  // 罠その2: 仮想パスの「ベース名が長い」と STEPControl_Reader.ReadFile が
-  //   0 roots を返す。実測(同一バイト)では:
-  //     /b /x /a /m .step (1文字) → 成功 / /model /input /model2 .step → 失敗
-  //   FS 内容は byte 一致で検証済みなのに名前長で挙動が変わる。embind/OCCT の
-  //   ファイル名マーシャリングに fixed-size バッファ overflow 系のバグがある。
-  //   短いベース名なら確実に回避できるので固定で '/m.step' を使う。
-  const virtualPath = '/m.step'
-  try {
-    oc.FS.unlink(virtualPath)
-  } catch {
-    /* 初回は存在しない */
-  }
-  oc.FS.writeFile(virtualPath, bytes)
-  const reader = new oc.STEPControl_Reader_1()
-  reader.ReadFile(virtualPath)
-  const nRoots = reader.NbRootsForTransfer()
-  oc.FS.unlink(virtualPath)
-  // ReadFile が返す IFSelect_ReturnStatus 列挙は embind 上で値比較が当てにならない
-  // （RetDone との一致が取れない）。成否は「転送可能ルート数」で判定する。
-  if (nRoots < 1) {
-    throw new Error('STEP読込失敗（ファイル破損・非対応、または転送ルート無し）')
-  }
-  reader.TransferRoots()
-  const shape = reader.OneShape()
-  if (shape.IsNull()) throw new Error('STEP: 形状が空')
+  const shape =
+    kind === 'stl' ? readStlShape(oc, bytes) : readXsShape(oc, kind, bytes)
 
-  // テッセレーション（線形/角度たわみ）。bbox対角の相対値で線形たわみを決める。
+  // テッセレーション（線形/角度たわみ）。
+  // 罠: StlAPI_Reader は「三角形1枚ごとに独立した平面 TopoDS_Face」を作るだけで、
+  // Poly_Triangulation は付与しない（テッセレーション済みではない）。STL でも
+  // IncrementalMesh を走らせないと BRep_Tool.Triangulation が null になり
+  // 面情報ゼロで描画が空になる。各面は元々平面なので、たわみを掛けても
+  // 三角形は増えず入力ジオメトリを素直に再現する。
   const bbox = computeBBox(oc, shape)
   const diag = Math.hypot(
     bbox.max[0] - bbox.min[0],
@@ -175,6 +236,9 @@ export async function loadStep(bytes: Uint8Array, name: string): Promise<ModelMe
   const model: LoadedModel = {
     id,
     name,
+    // STL はパラメトリック面を持たず真値計測（BRepExtrema/GProp）が成立しないため、
+    // 本家 backend の mesh 経路（trimesh・計測無効）と挙動を揃える。
+    format: kind === 'stl' ? 'mesh' : 'brep',
     shape,
     faces,
     bbox,
