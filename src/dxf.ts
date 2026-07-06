@@ -86,7 +86,9 @@ type FlatEntity =
   | { type: 'arc'; c: [number, number]; r: number; startDeg: number; sweepDeg: number }
   | { type: 'polyline'; pts: [number, number][]; bulges: number[]; closed: boolean }
   | { type: 'point'; p: [number, number] }
-  | { type: 'ellipsePoly'; pts: [number, number][] } // 非一様スケールで円/弧が楕円になる場合の近似
+  // 非一様スケールで円/弧が楕円になる場合の近似。centerは変換後のワールド座標
+  // （collectSnapsで中心スナップ点を出すために保持 — Codexレビュー指摘対応）。
+  | { type: 'ellipsePoly'; pts: [number, number][]; center: [number, number] }
 
 // Codexレビュー指摘(P2、実測で確認・修正): 旧実装は変換を{dx,dy,rotDeg,sx,sy}
 // (回転角+軸ごとスケール)に「都度分解・再構成」しており、鏡映(sx<0等)を
@@ -181,6 +183,9 @@ function sampleArcLocalPoints(c: [number, number], r: number, startDeg: number, 
 
 function flattenEntities(entities: IEntity[], blocks: Record<string, IBlock>, x: Xform, depth: number, out: FlatEntity[]): void {
   for (const e of entities) {
+    // Codexレビュー指摘(P2): 可視性フラグ(グループコード60)でvisible===false
+    // の非表示エンティティ(補助線等)まで描画・スナップ対象にしていた。
+    if ((e as { visible?: boolean }).visible === false) continue
     try {
       flattenOne(e, blocks, x, depth, out)
     } catch {
@@ -204,7 +209,11 @@ function flattenOne(e: IEntity, blocks: Record<string, IBlock>, x: Xform, depth:
       if (isUniform(x)) {
         out.push({ type: 'circle', c: applyXform(x, [ce.center.x, ce.center.y]), r: ce.radius * uniformScale(x) })
       } else {
-        out.push({ type: 'ellipsePoly', pts: sampleEllipse([ce.center.x, ce.center.y], ce.radius, x, 0, 360) })
+        out.push({
+          type: 'ellipsePoly',
+          pts: sampleEllipse([ce.center.x, ce.center.y], ce.radius, x, 0, 360),
+          center: applyXform(x, [ce.center.x, ce.center.y]),
+        })
       }
       return
     }
@@ -246,7 +255,11 @@ function flattenOne(e: IEntity, blocks: Record<string, IBlock>, x: Xform, depth:
           sweepDeg: flip ? -nativeSweepDeg : nativeSweepDeg,
         })
       } else {
-        out.push({ type: 'ellipsePoly', pts: sampleEllipse([ae.center.x, ae.center.y], ae.radius, x, startDeg0, endDeg0) })
+        out.push({
+          type: 'ellipsePoly',
+          pts: sampleEllipse([ae.center.x, ae.center.y], ae.radius, x, startDeg0, endDeg0),
+          center: applyXform(x, [ae.center.x, ae.center.y]),
+        })
       }
       return
     }
@@ -563,6 +576,10 @@ function collectSnaps(flat: FlatEntity[], bb: { min: [number, number]; max: [num
       for (const p of e.pts) add(p, 'vertex')
     } else if (e.type === 'point') {
       add(e.p, 'point')
+    } else if (e.type === 'ellipsePoly') {
+      // Codexレビュー指摘(P2): 非一様スケール配下の円/弧(ellipsePoly)に
+      // centerスナップが無く、穴/シンボルの中心を計測モードで拾えなかった。
+      add(e.center, 'center')
     }
   }
   return out
