@@ -33,10 +33,17 @@ export function computeVertexThickness(
   const out = new Float32Array(nVerts) // 0 = no data
   if (nVerts === 0 || indices.length === 0) return out
 
+  // Codexレビュー指摘(P1): このBufferAttributeは MeshPack の indices 配列を
+  // そのままラップしている。同じ typed array は viewer/picker 側の描画メッシュや
+  // picking.ts のBVH(faceRanges対応)とも共有されているため、既定の
+  // MeshBVH(geometry) はビルド高速化のため index を「その場で並べ替える」—
+  // これをやると三角形順序とfaceRanges(triStart/triCount)の対応が壊れ、
+  // 肉厚計算の後にピック/計測が誤ったB-repの面を指すようになる
+  // （picking.ts が同じ理由で { indirect: true } を使っているのと同じ罠）。
   const geometry = new THREE.BufferGeometry()
   geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3))
   geometry.setIndex(new THREE.BufferAttribute(indices, 1))
-  const bvh = new MeshBVH(geometry)
+  const bvh = new MeshBVH(geometry, { indirect: true })
 
   // モデルスケールに追従する許容誤差（固定値ハードコード禁止 — エッジ
   // サンプリングのdeflectionで踏んだ罠と同じ教訓）
