@@ -98,7 +98,15 @@ async function contentHash(bytes: Uint8Array): Promise<string> {
   return Array.from(arr, (b) => b.toString(16).padStart(2, '0')).join('')
 }
 
-function metaOf(model: LoadedModel): ModelMeta {
+// Codexレビュー指摘(P2、6巡目): api.ts側のdisposeById(stale-cleanup)は「このアップ
+// ロード呼び出しがloadModel内で新規にパース・コミットしたモデル」だけを対象に
+// すべきで、「たまたま同じcontentHashで既存の共有モデルを再利用しただけ」の
+// cache-hit応答を消してはいけない。例: 現在表示中のSTEPと同じファイルを
+// 再アップロードした呼びが、その最中に完了した別アップロードにsupersededされる
+// と、cache-hit分岐は現在表示中のモデルと同じidを返す。ここでdisposeByIdする
+// と表示中のモデルごと消えてしまう。呼び出し元がstale時に破棄して良いかを
+// 判断できるよう、cache-hitかどうかをmetaに載せて伝える。
+function metaOf(model: LoadedModel, cached = false): ModelMeta {
   return {
     id: model.id,
     name: model.name,
@@ -107,6 +115,7 @@ function metaOf(model: LoadedModel): ModelMeta {
     triangleCount: model.triangleCount,
     partCount: 1,
     bbox: model.bbox,
+    cached,
   }
 }
 
@@ -282,7 +291,7 @@ export async function loadModel(bytes: Uint8Array, name: string): Promise<ModelM
     // 自分の開始後により新しい読込が始まっていたら、evictを行わない
     // （現在のモデルを巻き込んで消す事故を防ぐ）。
     if (gen === _loadGen) evictOthers(id)
-    return metaOf(cached)
+    return metaOf(cached, true)
   }
   // 注意: eviction は「新モデルのパース成功後」に行う（下部）。パース前に消すと、
   // 壊れた入力で読込失敗した際に表示中の旧モデルまで _models から消え、

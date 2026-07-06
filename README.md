@@ -368,6 +368,31 @@ occt.ts内部で足止めしている間にDXFへ切替、STEP読込が再開し
 モデルが`disposeById`で破棄され`fetchMesh`が期待通り失敗すること
 （修正前はコミットされたまま残り`fetchMesh`が成功してしまうこと）を確認した。
 
+**罠（Codexレビュー指摘、実測で確認・修正済み、6巡目）**: 上記の
+`disposeById`は「このアップロード呼び出しが`loadModel`内で新規にパース・
+コミットしたモデル」だけを対象にすべきだったが、`occt.ts`の`loadModel`は
+`contentHash`が既存モデルとヒットした場合（同一ファイルの再アップロード等）
+は新規パース・コミットを一切せず既存モデルをそのまま返す（cache-hit）。
+このcache-hit応答も同じ`meta.id`を持つため、supersededな呼び出しが
+cache-hitで戻ってきた場合、それが指すidは「自分専用の孤児」ではなく
+「他の呼び出し（現在表示中かもしれない）と共有中のモデル」であり得る。
+修正前のコードはこの区別をせず無条件に`disposeById(meta.id)`していた
+ため、同一ファイルをほぼ同時に2回アップロードすると、後発（速い）が
+新規コミットして「現在」になった直後に、先発（遅い、supersededされた）が
+cache-hitで同じidを返し、現在表示中のモデルをdisposeByIdで消してしまう
+事故が起きた。`ModelMeta`に`cached`フラグを追加し（`occt.ts`の
+`metaOf(model, cached)`がcache-hit時は`true`を返す）、`api.ts`側は
+`meta.cached`が真の時は`disposeById`をスキップするよう修正。
+
+実ブラウザで、同一STEPファイルを`__stallNextLoad`で先発だけ遅延させつつ
+ほぼ同時に2回アップロードし、後発（無遅延）が先にコミットして「現在」に
+なった後、先発がcache-hitで同じidを返す状況を決定的に再現。修正前は
+現在表示中のモデルが消え`fetchMesh`が`unknown model id`で失敗すること
+（cached判定自体もこの回で初めて`ModelMeta`に実装されるまで存在せず、
+常に`undefined`だった）を確認し、修正後は`meta.cached===true`のケースで
+disposeをスキップして表示中モデルが生き残り`fetchMesh`が成功し続ける
+ことを確認した。
+
 ## 開発
 
 ```bash

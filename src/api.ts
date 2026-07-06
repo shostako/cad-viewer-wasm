@@ -122,7 +122,7 @@ export async function uploadModel(file: File): Promise<ModelMeta> {
   if (gen === _uploadGen) {
     disposeAllThreeMf()
     disposeAllDxf()
-  } else {
+  } else if (!meta.cached) {
     // Codexレビュー指摘: occt.ts内の_loadGenは「同じOCCTローダー内」のレース
     // しか見ていない。このSTEP/IGES/STL読込がinitOcct()/contentHash()で
     // await中に3MF/DXFへの切替(このgen !== _uploadGen)が発生してsuperseded
@@ -131,6 +131,16 @@ export async function uploadModel(file: File): Promise<ModelMeta> {
     // UIには一生表示されないのに、disposeAll()が呼ばれるまでWASMヒープに
     // 残り続ける。disposeAll()は他の正当な現在モデルを巻き込む恐れがある
     // ため使わず、このIDだけを指定して確実に破棄する。
+    //
+    // Codexレビュー指摘(6巡目、P2): 上記のdisposeByIdは「このアップロード
+    // 呼び出しがloadModel内で新規にパース・コミットしたモデル」だけを対象に
+    // すべき。meta.cachedがtrue(occt.ts側でcontentHashが既存モデルとヒットし、
+    // 新規パース・コミットを一切せずに既存モデルをそのまま返した場合)は、その
+    // idは自分専用の孤児ではなく他の呼び出し（現在表示中のものかもしれない）
+    // と共有されている可能性があるため、disposeByIdしてはいけない
+    // （実ブラウザで「同一ファイルの再アップロードが、進行中の別アップロード
+    // にsupersededされ、cache-hitで現在表示中のモデルと同じidを返すケース」
+    // を再現し、このガード無しだと表示中モデルが消えることを確認した）。
     void occtWorker.disposeById(meta.id).catch(() => {})
   }
   return meta
