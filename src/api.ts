@@ -11,6 +11,7 @@
 import type { MeshPack } from './meshpack'
 import { loadModel, meshPackOf, distance, faceInfo, edgeInfo, disposeAll as disposeAllOcct } from './occt'
 import { load3mf, meshPackOf3mf, disposeAll as disposeAllThreeMf } from './threemf'
+import { loadDxf, svgOf, disposeAll as disposeAllDxf } from './dxf'
 import { computeVertexThickness } from './thickness'
 
 export interface ModelMeta {
@@ -26,29 +27,42 @@ export interface ModelMeta {
   snapPoints?: { dxf: [number, number]; svg: [number, number]; kind: string }[]
 }
 
-export async function fetchDrawingSvg(_modelId: string): Promise<string> {
-  // 2D図面(DXF)はWASM移植の後段。スパイクでは未対応。
-  throw new Error('2D図面はこのビルドでは未対応')
+export async function fetchDrawingSvg(modelId: string): Promise<string> {
+  return svgOf(modelId)
 }
 
 export async function uploadModel(file: File): Promise<ModelMeta> {
   const bytes = new Uint8Array(await file.arrayBuffer())
-  // 3MF は OCCT に読込手段が無いため専用の純JS経路（threemf.ts）へ分岐する。
-  // モデルIDのプレフィックス（occt.ts='m', threemf.ts='t'）で fetchMesh 側の
-  // 参照先レジストリを判定する。
+  const lower = file.name.toLowerCase()
+  // 3MF/DXF は OCCT に読込手段が無い（3MF）か WASM化不可（DWG、DXFのみ純JSで
+  // 対応）ため専用の純JS経路へ分岐する。モデルIDのプレフィックス
+  // （occt.ts='m', threemf.ts='t', dxf.ts='d'）で fetchMesh/fetchDrawingSvg
+  // 側の参照先レジストリを判定する。
   //
-  // 罠(Codexレビュー指摘): 各ローダーは自分のレジストリ内でしか evictOthers
-  // しないため、形式を跨いで切り替える（STEP→3MF→STEP...）と前の形式の
-  // モデルが「もう一方」のレジストリに残り続ける。OCCT側は embind オブジェクトが
-  // GCされずWASMヒープを圧迫し続けるため実害が大きい。新モデルのパース成功後に
-  // 反対側のレジストリを破棄する（occt.ts自身の「成功後に破棄」規律と同じ順序）。
-  if (file.name.toLowerCase().endsWith('.3mf')) {
+  // 罠(Codexレビュー指摘、3MF追加時に発覚): 各ローダーは自分のレジストリ内
+  // でしか evictOthers しないため、形式を跨いで切り替える（STEP→3MF→STEP...）
+  // と前の形式のモデルが「もう一方」のレジストリに残り続ける。OCCT側は embind
+  // オブジェクトがGCされずWASMヒープを圧迫し続けるため実害が大きい。新モデルの
+  // パース成功後に他の全レジストリを破棄する（occt.ts自身の「成功後に破棄」
+  // 規律と同じ順序）。DXF追加でレジストリが3つになったので同じ規律を踏襲する。
+  if (lower.endsWith('.dwg')) {
+    throw new Error('DWGはこのビルドでは未対応（ODA File ConverterはWASM化不可・非再配布のネイティブバイナリ）。DXFなら対応')
+  }
+  if (lower.endsWith('.dxf')) {
+    const meta = await loadDxf(bytes, file.name)
+    disposeAllOcct()
+    disposeAllThreeMf()
+    return meta
+  }
+  if (lower.endsWith('.3mf')) {
     const meta = await load3mf(bytes, file.name)
     disposeAllOcct()
+    disposeAllDxf()
     return meta
   }
   const meta = await loadModel(bytes, file.name)
   disposeAllThreeMf()
+  disposeAllDxf()
   return meta
 }
 

@@ -424,6 +424,10 @@ testHooks.__cadProject = (x: number, y: number, z: number) => {
     y: rect.top + ((1 - v.y) / 2) * rect.height,
   }
 }
+// spike検証用: 2D図面のスナップ計測モードをUIのlil-guiセレクトに依らず直接切替
+testHooks.__cadSet2DMeasureMode = (on: boolean) => {
+  drawing2d.measureMode = on
+}
 testHooks.__cadStallMeasure = (ms: number) => __stallNextMeasure(ms)
 testHooks.__cadStallSidecar = (ms: number) => __stallNextSidecar(ms)
 // spike検証用: 2つの面ID間の真値距離を直接測る（ピクセルピック非依存の計測実証）
