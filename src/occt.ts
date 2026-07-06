@@ -131,6 +131,25 @@ export function disposeAll(): void {
 }
 
 /**
+ * 特定のIDのモデルだけを破棄する。
+ *
+ * Codexレビュー指摘(P2): _loadGenは「同じOCCTローダー内」のレースしか見て
+ * いないため、STEP読込がinitOcct()/contentHash()でawait中に3MF/DXFへの
+ * 切替(api.ts側の_uploadGen)が発生してsupersededされても、他にOCCT読込が
+ * 無ければ「gen === _loadGen」が成立してしまい、そのSTEPモデルは普通に
+ * _modelsへコミットされてしまう。UIには一生表示されないのに、disposeAll()
+ * が呼ばれるまでWASMヒープに残り続ける。disposeAll()で一括破棄すると、
+ * その後に本当に始まった正当な新しいOCCT読込まで巻き込みかねないため、
+ * api.ts側が「このIDだけ」を指定して確実に破棄できる手段を用意する。
+ */
+export function disposeById(id: string): void {
+  const m = _models.get(id)
+  if (!m) return
+  disposeModel(m)
+  _models.delete(id)
+}
+
+/**
  * embind オブジェクトの一括破棄。GC されないため計測・テッセレーションの
  * ホットパスで必ず使う。実ブラウザで安全性を検証済み（下記の唯一の例外を除き、
  * 「派生オブジェクトを取り出した後に元オブジェクトを delete」しても派生側は

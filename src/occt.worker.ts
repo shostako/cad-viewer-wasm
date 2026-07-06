@@ -15,9 +15,9 @@
  * この移植を行った）。
  */
 import * as Comlink from 'comlink'
-import { loadModel, meshPackOf, distance, faceInfo, edgeInfo, disposeAll, __stallNextLoad } from './occt'
+import { loadModel, meshPackOf, distance, faceInfo, edgeInfo, disposeAll, disposeById, __stallNextLoad } from './occt'
 
-const api = { loadModel, meshPackOf, distance, faceInfo, edgeInfo, disposeAll, __stallNextLoad }
+const api = { loadModel, meshPackOf, distance, faceInfo, edgeInfo, disposeAll, disposeById, __stallNextLoad }
 
 export type OcctWorkerApi = typeof api
 

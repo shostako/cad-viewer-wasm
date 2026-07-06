@@ -122,6 +122,16 @@ export async function uploadModel(file: File): Promise<ModelMeta> {
   if (gen === _uploadGen) {
     disposeAllThreeMf()
     disposeAllDxf()
+  } else {
+    // Codexレビュー指摘: occt.ts内の_loadGenは「同じOCCTローダー内」のレース
+    // しか見ていない。このSTEP/IGES/STL読込がinitOcct()/contentHash()で
+    // await中に3MF/DXFへの切替(このgen !== _uploadGen)が発生してsuperseded
+    // されても、他にOCCT読込が無ければocct.ts側の「gen === _loadGen」は
+    // 成立してしまい、このモデルは普通に_modelsへコミットされてしまう。
+    // UIには一生表示されないのに、disposeAll()が呼ばれるまでWASMヒープに
+    // 残り続ける。disposeAll()は他の正当な現在モデルを巻き込む恐れがある
+    // ため使わず、このIDだけを指定して確実に破棄する。
+    void occtWorker.disposeById(meta.id).catch(() => {})
   }
   return meta
 }
