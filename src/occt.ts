@@ -326,8 +326,11 @@ export async function loadModel(bytes: Uint8Array, name: string): Promise<ModelM
     vertexCount: 0,
     meshPack: undefined as unknown as MeshPack,
   }
-  // メッシュを即構築してキャッシュ（三角形/頂点数を meta に載せるため）
-  model.meshPack = buildMeshPack(oc, model)
+  // メッシュを即構築してキャッシュ（三角形/頂点数を meta に載せるため）。
+  // エッジのサンプリング許容誤差(deflection)は面メッシュと同じ linDefl を使う
+  // （Codexレビュー指摘: 固定値0.1だとメートル単位の小さい円弧・穴がほぼ潰れ、
+  // 見た目上は曲線があるのにスナップ/計測できなくなるモデルスケール依存バグ）。
+  model.meshPack = buildMeshPack(oc, model, linDefl)
   _models.set(id, model)
   // パース成功が確定してから旧モデルを破棄する（読込失敗時に表示中モデルを
   // 巻き込まないため）。瞬間的に旧+新が同居するが、正しさをメモリ最小化より優先。
@@ -367,7 +370,7 @@ export async function meshPackOf(id: string): Promise<MeshPack> {
  * 法線は三角形の巻き順から自前計算（このビルドに法線ヘルパーが無いため）。
  * shape は BRepMesh_IncrementalMesh 済みが前提（loadStep 内で実行済み）。
  */
-function buildMeshPack(oc: OC, model: LoadedModel): MeshPack {
+function buildMeshPack(oc: OC, model: LoadedModel, linDefl: number): MeshPack {
   const positions: number[] = []
   const normals: number[] = []
   const indices: number[] = []
@@ -463,7 +466,7 @@ function buildMeshPack(oc: OC, model: LoadedModel): MeshPack {
   const posArr = new Float32Array(positions)
   const nrmArr = new Float32Array(normals)
   const idxArr = new Uint32Array(indices)
-  const { edgeArr, edgeRanges } = buildEdges(oc, model)
+  const { edgeArr, edgeRanges } = buildEdges(oc, model, linDefl)
   const vertArr = buildVertices(oc, model)
 
   // parseMeshPack が返すのと同じ形。BufferDesc の offset/byteLength は本経路では
@@ -527,10 +530,17 @@ function buildVertices(oc: OC, model: LoadedModel): Float32Array {
  * ピッキングの画面上スナップ候補判定にしか使わず、実測値は常に edgeInfo/distance
  * が B-rep 実体（TopoDS_Edge）から真値計算するので正確性には影響しない。
  * 60エッジ全数・全面で実ブラウザ検証しクラッシュ0件を確認済み。
+ *
+ * 罠(Codexレビュー指摘): サンプリング許容誤差(deflection)は固定値でなく
+ * linDefl（loadModel が bbox 対角から算出、面メッシュと同じ値）を使う。
+ * 固定値0.1だとメートル単位の小さい円弧・穴径の円形エッジがほぼ潰れ
+ * （両端点だけ、あるいはほぼ長さ0のセグメントになる）、見た目には曲線が
+ * あるのに snapEdge がそれを候補として拾えなくなる。
  */
 function buildEdges(
   oc: OC,
   model: LoadedModel,
+  linDefl: number,
 ): { edgeArr: Float32Array; edgeRanges: { edgeId: number; segStart: number; segCount: number }[] } {
   const segs: number[] = []
   const edgeRanges: { edgeId: number; segStart: number; segCount: number }[] = []
@@ -541,7 +551,7 @@ function buildEdges(
     const curve = new oc.BRepAdaptor_Curve_2(edge)
     // 第3引数は Continuity()（曲線の連続性）。QuasiUniformDeflectionの3引数
     // オーバーロードはこの並びを要求する（実測済み）。
-    const sampler = new oc.GCPnts_QuasiUniformDeflection_2(curve, 0.1, curve.Continuity())
+    const sampler = new oc.GCPnts_QuasiUniformDeflection_2(curve, linDefl, curve.Continuity())
     if (sampler.IsDone()) {
       const n: number = sampler.NbPoints()
       if (n >= 2) {
