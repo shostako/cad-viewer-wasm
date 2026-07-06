@@ -43,6 +43,15 @@ export async function fetchDrawingSvg(modelId: string): Promise<string> {
   return svgOf(modelId)
 }
 
+// test-only: 次のOCCT読込(occt.ts内のloadModel、gen採番の直後)だけ人為的に
+// 遅延させる。2つのアップロードが重なった時の世代ガード（occt.ts の
+// _loadGen）を決定的に再現するためのフック（既存の __stallNextMeasure と
+// 同じ流儀）。Worker側(occt.ts)のgen採番後に遅延させる必要があるため、
+// api.ts側でRPC呼び出し前に遅延させるのではなく、occtWorker自身に委譲する。
+export function __stallNextLoad(ms: number): Promise<void> {
+  return occtWorker.__stallNextLoad(ms)
+}
+
 export async function uploadModel(file: File): Promise<ModelMeta> {
   const bytes = new Uint8Array(await file.arrayBuffer())
   const lower = file.name.toLowerCase()

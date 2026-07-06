@@ -10,6 +10,7 @@ import {
   putSidecar,
   __stallNextMeasure,
   __stallNextSidecar,
+  __stallNextLoad,
   type ModelMeta,
 } from './api'
 import { Drawing2D } from './drawing2d'
@@ -430,6 +431,7 @@ testHooks.__cadSet2DMeasureMode = (on: boolean) => {
 }
 testHooks.__cadStallMeasure = (ms: number) => __stallNextMeasure(ms)
 testHooks.__cadStallSidecar = (ms: number) => __stallNextSidecar(ms)
+testHooks.__cadStallLoad = (ms: number) => __stallNextLoad(ms)
 // spike検証用: 2つの面ID間の真値距離を直接測る（ピクセルピック非依存の計測実証）
 testHooks.__cadFaceDistance = async (idA: number, idB: number) => {
   if (!currentModelId) return null

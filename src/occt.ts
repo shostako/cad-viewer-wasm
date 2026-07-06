@@ -61,6 +61,22 @@ interface LoadedModel {
 }
 
 const _models = new Map<string, LoadedModel>()
+// Codexレビュー指摘(P2): loadModelは複数箇所でawaitするため、2つのアップロードが
+// 重なると後発(より小さい/速い)の読込が先に完了してUIの「現在のモデル」になった
+// 後、先発(遅い)の読込がその後で完了しevictOthers(id)を呼ぶと、UIが現在と
+// 思っているモデルまで_modelsから消してしまい、以降のfetchMesh/計測が
+// unknown model idで失敗する。世代カウンタで「自分の開始後により新しい読込が
+// 始まっていたら、evict/コミットを行わず自分のリソースだけ破棄する」よう
+// 直列化する。
+let _loadGen = 0
+
+// test-only: 次のloadModel呼び出しについて、gen採番の直後・重いパース処理の
+// 前に人為的な遅延を入れる。上記のレース（先発の遅い読込が後発より遅く
+// 完了する状況）を実ブラウザで決定的に再現するためのフック。
+let _stallNextLoadMs = 0
+export function __stallNextLoad(ms: number): void {
+  _stallNextLoadMs = ms
+}
 
 type Kind = 'step' | 'iges' | 'stl' | 'unsupported'
 
@@ -225,6 +241,12 @@ function readStlShape(oc: OC, bytes: Uint8Array): OC {
 
 /** モデルファイルを読み、shape と面配列を格納して ModelMeta を返す。 */
 export async function loadModel(bytes: Uint8Array, name: string): Promise<ModelMeta> {
+  const gen = ++_loadGen
+  if (_stallNextLoadMs > 0) {
+    const ms = _stallNextLoadMs
+    _stallNextLoadMs = 0
+    await new Promise((r) => setTimeout(r, ms))
+  }
   const oc = await initOcct()
   const kind = classify(name)
   if (kind === 'unsupported') {
@@ -238,7 +260,9 @@ export async function loadModel(bytes: Uint8Array, name: string): Promise<ModelM
   // 同一内容が既にロード済みなら再パースせず再利用（backend のハッシュ dedup 相当）
   const cached = _models.get(id)
   if (cached) {
-    evictOthers(id)
+    // 自分の開始後により新しい読込が始まっていたら、evictを行わない
+    // （現在のモデルを巻き込んで消す事故を防ぐ）。
+    if (gen === _loadGen) evictOthers(id)
     return metaOf(cached)
   }
   // 注意: eviction は「新モデルのパース成功後」に行う（下部）。パース前に消すと、
@@ -334,7 +358,13 @@ export async function loadModel(bytes: Uint8Array, name: string): Promise<ModelM
   _models.set(id, model)
   // パース成功が確定してから旧モデルを破棄する（読込失敗時に表示中モデルを
   // 巻き込まないため）。瞬間的に旧+新が同居するが、正しさをメモリ最小化より優先。
-  evictOthers(id)
+  // Codexレビュー指摘: 自分の開始後により新しい読込が始まっていた場合、その
+  // 新しい読込が既に完了しUIの「現在のモデル」になっている可能性がある。
+  // ここでevictOthersすると現在のモデルまで巻き込んで_modelsから消してしまう
+  // ため、その場合はevictをスキップする（例外は投げない — main.tsのエラー
+  // ハンドラはstale判定なしに表示中HUDを上書きするため、ここで失敗させると
+  // 現在正常に表示されているモデルの上にエラーメッセージが出てしまう）。
+  if (gen === _loadGen) evictOthers(id)
 
   return metaOf(model)
 }
