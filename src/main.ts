@@ -388,6 +388,13 @@ async function loadFile(file: File): Promise<void> {
       if (restoringOwner === gen) restoringOwner = 0
     }
   } catch (e) {
+    // Claude(GitHub Action)レビュー指摘: このcatchだけ他の全returnポイントと
+    // 違いstale判定(gen !== loadGen)が無かった。壊れたファイル・未対応形式
+    // 等で正当にthrowするケースで、先発(遅い)の読込が後発(速い、正常)の
+    // 読込にsupersededされた後にthrowすると、既に正しく表示されている
+    // 後発モデルのHUDをstaleなエラーメッセージで上書きしてしまう
+    // （3Dシーン自体は後発のままなので、表示とHUDが矛盾する）。
+    if (gen !== loadGen) return // stale failure — a newer load already won
     hudInfo.textContent = `エラー: ${e instanceof Error ? e.message : e}`
   }
 }
