@@ -535,7 +535,12 @@ function buildSvg(flat: FlatEntity[], bb: { min: [number, number]; max: [number,
   const w = Math.max(bb.max[0] - bb.min[0], 1e-6)
   const h = Math.max(bb.max[1] - bb.min[1], 1e-6)
   const to = (p: [number, number]): [number, number] => [p[0] - bb.min[0], bb.max[1] - p[1]]
-  const STROKE = '#e8e8e8'
+  // バグ修正: 旧値 '#e8e8e8' は3Dビューア(暗背景, viewer.tsのEDGE_COLOR等)向けの
+  // 薄グレーで、#viewport2dの明るい背景(style.css、製図用紙的な白系)に対しては
+  // ほぼ同系色でコントラストが無く「白背景にうっすら図面」になっていた
+  // （ユーザー実機で確認済みのバグ）。2Dパネルは白地に濃い線という前提のため、
+  // 濃色（viewer.tsの3D背景色と同系の#1d2126）に変更する。
+  const STROKE = '#1d2126'
   const lines: string[] = []
   for (const e of flat) {
     if (e.type === 'line') {
