@@ -362,12 +362,20 @@ function readLabelName(oc: OC, label: OC): string | null {
   const guid = oc.TDataStd_Name.GetID()
   const outAttr = new oc.Handle_TDF_Attribute_1()
   const found = label.FindAttribute_1(guid, outAttr)
-  if (!found) return null
+  if (!found) {
+    del(outAttr)
+    return null
+  }
   const extStrVal = outAttr.get().Get()
   const ascii = new oc.TCollection_AsciiString_13(extStrVal, 63) // 63='?'（非ASCII文字の置換用）
   const len = ascii.Length()
   let s = ''
   for (let k = 1; k <= len; k++) s += String.fromCharCode(ascii.Value(k))
+  // Codexレビュー指摘: outAttr(Handle)とascii(このラベル専用に新規変換した
+  // 値、他パートと共有しない)は読み終えたら破棄する。outAttr.get()の戻り値
+  // (TDataStd_Nameインスタンス)自体は破棄しない — Handle破棄は.get()の戻り値に
+  // 影響しない、という既存の実測パターン（triHandle等）に倣う。
+  del(ascii, outAttr)
   return s
 }
 
@@ -376,8 +384,15 @@ function shapeFromLabel(oc: OC, label: OC): OC | null {
   const guid = oc.TNaming_NamedShape.GetID()
   const outAttr = new oc.Handle_TDF_Attribute_1()
   const found = label.FindAttribute_1(guid, outAttr)
-  if (!found) return null
+  if (!found) {
+    del(outAttr)
+    return null
+  }
+  // shapeは下地のTopoDS_TShapeを共有する永続データ（複数コンポーネントから
+  // 参照され得る）なのでここでは破棄しない。outAttr(Handle)だけ破棄する
+  // （Handle破棄は.get()の戻り値に影響しない、という既存の実測パターンに倣う）。
   const shape = outAttr.get().Get()
+  del(outAttr)
   return shape.IsNull() ? null : shape
 }
 
@@ -462,6 +477,7 @@ function readXcafParts(oc: OC, bytes: Uint8Array): XcafResult | null {
     const mainLabel = doc.Main()
     const hShapeTool = oc.XCAFDoc_DocumentTool.ShapeTool(mainLabel)
     const shapeTool = hShapeTool.get()
+    del(hShapeTool) // Handle破棄は.get()の戻り値(shapeTool)に影響しない（既存の実測パターンに倣う）
     const baseLabel = shapeTool.BaseLabel()
     const nbFree = baseLabel.NbChildren()
     if (nbFree < 1) {
@@ -488,6 +504,14 @@ function readXcafParts(oc: OC, bytes: Uint8Array): XcafResult | null {
     }
     const leaves: Leaf[] = []
     let nextPartId = 0
+    // Codexレビュー指摘: walk()内で作るTDF_Label(outRef)・TopLoc_Location
+    // (compLoc、accLoc.Multiplied()の新規結果)は、末端のleafで
+    // 保持され続けたり(l.label/l.loc)、後段（bbox算出・重複排除メッシング・
+    // 最終パート組み立て）で使われ続けたりするため、walk()実行中には安全に
+    // 破棄できない。ここに集めておき、それら全ての用が済んだ後（parts組み立て
+    // 完了後）にまとめて破棄する。
+    const tempLabels: OC[] = []
+    const tempLocs: OC[] = []
 
     // アセンブリでない単純な形状か判定するには、まずTNaming_NamedShapeが直接
     // 付いているかを見る（付いていればリーフ）。IsAssembly静的判定と併用し、
@@ -496,6 +520,10 @@ function readXcafParts(oc: OC, bytes: Uint8Array): XcafResult | null {
       const isAssembly: boolean = oc.XCAFDoc_ShapeTool.IsAssembly(label)
       const nbChildren: number = label.NbChildren()
       if (!isAssembly || nbChildren === 0) {
+        // rawShapeはここでは存在確認だけに使う「リーフか否か」の判定用。
+        // 下地TopoDS_TShapeを共有する永続データ（tri等と同様）のため、
+        // 万一の共有破壊を避けてここでは破棄しない（bbox/mesh/parts組み立て
+        // の各パスでshapeFromLabelを呼び直し、都度フレッシュな参照を使う）。
         const rawShape = shapeFromLabel(oc, label)
         if (!rawShape) return null
         const name = readLabelName(oc, label) ?? `part${nextPartId + 1}`
@@ -510,8 +538,14 @@ function readXcafParts(oc: OC, bytes: Uint8Array): XcafResult | null {
         const outRef = new oc.TDF_Label()
         const isRef: boolean = oc.XCAFDoc_ShapeTool.GetReferredShape(compLabel, outRef)
         const targetLabel = isRef ? outRef : compLabel
+        tempLabels.push(outRef) // isRef===falseでも未使用のまま破棄対象に含めて良い
         const compLoc = oc.XCAFDoc_ShapeTool.GetLocation(compLabel)
         const combinedLoc = accLoc ? accLoc.Multiplied(compLoc) : compLoc
+        // accLocがある場合のみMultiplied()で新規オブジェクトが作られ、compLoc
+        // 自体はそれ以降不要になる（combinedLocとは別物）。accLocが無い場合は
+        // combinedLoc===compLocそのものなので、ここで破棄対象に入れない
+        // （Leafに保持され後段で使われるため）。
+        if (accLoc) tempLocs.push(compLoc)
         const node = walk(targetLabel, combinedLoc)
         if (node) children.push(node)
       }
@@ -557,6 +591,11 @@ function readXcafParts(oc: OC, bytes: Uint8Array): XcafResult | null {
       bboxTmp.max[2] - bboxTmp.min[2],
     )
     const linDefl = Math.max(diagTmp * 1e-3, 1e-6)
+    // bbox算出専用の使い捨てコピー。TopoDS_Shape系の破棄はFace/Edge/Vertex
+    // （disposeModelで日常的にまとめて破棄しており安全性が確認済み）と同じ
+    // カテゴリなので、ここで破棄して良い（Poly_Triangulationの明示delete
+    // だけが特別に危険 — 上記の罠コメント参照）。
+    for (const s of placedForBbox) del(s)
 
     // ラベル単位で重複排除して1回だけメッシングする（同一形状定義を複数回
     // 参照するコンポーネントがあっても、下地のTopoDS_TShapeは1回だけ処理する）。
@@ -577,6 +616,14 @@ function readXcafParts(oc: OC, bytes: Uint8Array): XcafResult | null {
       const placed = l.loc ? raw.Located(l.loc) : raw
       return { name: l.name, shape: placed }
     })
+    // walk()内で作ったTDF_Label(outRef)・中間TopLoc_Location(compLoc)は、
+    // ここまでの全パス（bbox算出・重複排除メッシング・最終パート組み立て）で
+    // 使い終わったのでまとめて破棄する（Codexレビュー指摘への対応）。
+    // leaves自体が保持するlabel/loc（各パートの最終的な配置）はここでは
+    // 破棄しない — 破棄すると`Located()`で使い回すシェイプ自体は無事でも、
+    // 万一の再利用（例: エラー時の再試行系コード）に備えて安全側に倒す。
+    for (const t of tempLabels) del(t)
+    for (const t of tempLocs) del(t)
 
     const tree: TreeNode = roots.length === 1 ? roots[0] : { name: 'model', children: roots }
     // 成功: docは呼び出し元(loadModel)がモデルの寿命まで保持し、disposeModelで
