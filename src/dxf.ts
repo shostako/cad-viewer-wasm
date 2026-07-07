@@ -339,11 +339,15 @@ function flattenOne(e: IEntity, blocks: Record<string, IBlock>, layers: Record<s
       // group codeを収集し(loadDxf内で登録)、ここでその生データを解釈する。
       // 塗り(パターン/ソリッド)は描画対象外、境界の輪郭線のみ描画する
       // （実務図面のHATCHは断面表現等で頻出だが、本ビューアはOCCTを経由しない
-      // 純JS経路のため塗りつぶしパターン自体は非対応、README参照）。
+      // 純JS経路のため塗りつぶしパターン自体は非対応、README「未実装」参照）。
       const he = e as unknown as { rawGroups?: HatchRawGroups }
       if (!he.rawGroups) return
       const loops = parseHatchLoops(he.rawGroups)
       for (const loop of loops) {
+        // closed=true固定: HATCH境界パスは仕様上必ず閉じたループであり(開いた
+        // 境界は無効なデータ)、ポリライン境界の73(closed)フラグは今のところ
+        // 読んでいない(常にtrue相当として扱う)。LWPOLYLINE/POLYLINEの
+        // 73フラグとは意味が異なる点に注意。
         out.push(polylineLoopToFlat(loop.pts, loop.bulges, true, x))
       }
       return
@@ -511,12 +515,32 @@ function parseHatchLoops(groups: HatchRawGroups): HatchLoop[] {
               startDeg = (((-f50) % 360) + 360) % 360
               sweepDeg = -((((f51 - f50) % 360) + 360) % 360)
             }
-            const startRad = (startDeg * Math.PI) / 180
-            const px = cx + r * Math.cos(startRad)
-            const py = cy + r * Math.sin(startRad)
-            const bulge = Math.tan(((sweepDeg * Math.PI) / 180) / 4)
-            pts.push([px, py])
-            bulges.push(bulge)
+            // Claudeレビュー指摘(実データで確認・修正): 円形のHATCH境界
+            // (穴/アイランドでよくある「エッジ1本だけで50=0,51=360の全周円」)
+            // は、上のmod 360正規化でsweepDeg=0になり1点に潰れて消えてしまう
+            // (bulgeArcがchord<1e-12で弧なしと判定するため無描画になるバグ)。
+            // f50とf51がmod 360で一致するのにf50自体は一致しない(=全周分の
+            // 差がある)場合は全周円と判断し、180度ずつ2点+bulge(±1)に分割する
+            // (buildSvgのarcPathDが359.999度以上の弧を2分割するのと同じ手法)。
+            const diffMod = (((f51 - f50) % 360) + 360) % 360
+            const isFullCircle = diffMod === 0 && f50 !== f51
+            if (isFullCircle) {
+              const dir = ccw ? 1 : -1
+              const half = dir * (Math.PI / 4) // tan(180°の半分/4) = tan(45°) = 1
+              const a0 = (startDeg * Math.PI) / 180
+              const a1 = a0 + Math.PI
+              pts.push([cx + r * Math.cos(a0), cy + r * Math.sin(a0)])
+              bulges.push(Math.tan(half))
+              pts.push([cx + r * Math.cos(a1), cy + r * Math.sin(a1)])
+              bulges.push(Math.tan(half))
+            } else {
+              const startRad = (startDeg * Math.PI) / 180
+              const px = cx + r * Math.cos(startRad)
+              const py = cy + r * Math.sin(startRad)
+              const bulge = Math.tan(((sweepDeg * Math.PI) / 180) / 4)
+              pts.push([px, py])
+              bulges.push(bulge)
+            }
           } else {
             // 楕円弧(3)・スプライン(4)は未対応。可変長データで安全に読み飛ばす
             // 手段が無いため、このHATCH全体を諦める(flattenEntitiesのtry/catch
