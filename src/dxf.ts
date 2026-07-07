@@ -11,7 +11,22 @@
  * に相当する処理を持たないため）。
  *
  * 対応エンティティ: LINE, CIRCLE, ARC, LWPOLYLINE/POLYLINE(bulgeによる円弧
- * セグメント含む), POINT, INSERT(ブロック参照、ネスト展開)。
+ * セグメント含む), POINT, INSERT(ブロック参照、ネスト展開), HATCH(境界の輪郭線
+ * のみ、塗りパターン自体は非対応・下記参照)。
+ *
+ * HATCHについて: dxf-parser(依存ライブラリ)はHATCHエンティティを一切パースせず
+ * 黙って読み飛ばす（ソース中にhatchの文字列自体が無いことを実測で確認済み）。
+ * そのため`parser.registerEntityHandler`（dxf-parserが公開するプラグイン機構）
+ * で自前のハンドラを登録し、HATCHのDXF group codeを生のまま`rawGroups`として
+ * 保持させ、`parseHatchLoops`で境界パスデータ（91=パス数、92=パス種別フラグ、
+ * 93=エッジ数、72=エッジ種別、以下line/arcエッジ固有のコード）を解釈する。
+ * 塗り（ソリッド/パターン）の描画は行わず、境界の輪郭だけをpolyline
+ * (bulge付き)として他エンティティと同じ描画経路に載せる。エッジ種別3
+ * （楕円弧）・4（スプライン）は未対応（該当HATCHのみスキップ、ファイル全体
+ * には影響しない）。円弧エッジの向き（group 73=反時計回りフラグ）は実ファイル
+ * (clockwise_arcs_hatch.dxf、CW/CCW混在)で実測検証済み：エッジ列を連結した際に
+ * 前エッジの終点と次エッジの始点が一致することを確認済み（向きを誤ると
+ * ここが不連続になるため、これ自体が客観的な正しさの検証になる）。
  * 座標系: SVGは `0 0 W H`（W,H=bboxの幅高さ、DXF単位そのまま1:1）、
  * to_svg(x,y) = [x-xmin, ymax-y]（y反転）。backendのezdxfビューポート正規化
  * （viewBoxをmax=1e6にスケール）とは異なる独自スケールだが、契約
@@ -206,6 +221,38 @@ function flattenEntities(
   }
 }
 
+/** 局所座標系のbulge付き頂点列(直線/円弧混在)をワールド座標のpolyline
+ * FlatEntityへ変換する共通ヘルパー（LWPOLYLINE/POLYLINEとHATCH境界の両方で使う）。
+ * 非一様スケール変換下ではbulgeの円弧が楕円になってしまうため、局所座標系で
+ * 直線/円弧をあらかじめ密にサンプリングしてから点ごとに変換する
+ * （CIRCLE/ARCのellipsePoly対処と同じ理由）。一様変換なら鏡映によるbulge符号
+ * 反転だけ考慮すればよい。 */
+function polylineLoopToFlat(localPts: [number, number][], localBulges: number[], closed: boolean, x: Xform): FlatEntity {
+  if (localBulges.some((b) => b !== 0) && !isUniform(x)) {
+    const segs = polySegments(localPts, localBulges, closed)
+    const worldPts: [number, number][] = []
+    for (const seg of segs) {
+      const arc = bulgeArc(seg.a, seg.b, seg.bulge)
+      if (!arc) {
+        worldPts.push(applyXform(x, seg.a))
+      } else {
+        const sampled = sampleArcLocalPoints(arc.c, arc.r, arc.startDeg, arc.sweepDeg)
+        for (const p of sampled.slice(0, -1)) worldPts.push(applyXform(x, p))
+      }
+    }
+    if (!closed) {
+      const last = segs[segs.length - 1]
+      worldPts.push(applyXform(x, last.b))
+    }
+    return { type: 'polyline', pts: worldPts, bulges: worldPts.map(() => 0), closed }
+  } else {
+    const pts = localPts.map((p): [number, number] => applyXform(x, p))
+    const flip = isMirrored(x)
+    const bulges = flip ? localBulges.map((b) => -b) : localBulges
+    return { type: 'polyline', pts, bulges, closed }
+  }
+}
+
 function flattenOne(e: IEntity, blocks: Record<string, IBlock>, layers: Record<string, ILayer>, x: Xform, depth: number, out: FlatEntity[]): void {
   const t = (e as { type?: string }).type
   switch (t) {
@@ -282,37 +329,22 @@ function flattenOne(e: IEntity, blocks: Record<string, IBlock>, layers: Record<s
       const localPts: [number, number][] = vertices.map((v): [number, number] => [v.x, v.y])
       const localBulges: number[] = vertices.map((v) => v.bulge || 0)
       const closed = !!pe.shape
-      if (localBulges.some((b) => b !== 0) && !isUniform(x)) {
-        // Codexレビュー指摘(P2): bulgeは局所座標系での円弧を表すため、
-        // 非一様スケール(xScale!==yScale)のINSERT配下では変換後は楕円になる。
-        // 頂点だけ変換してbulge値をそのまま残すと、変換後の2点から再構成した
-        // 別の円弧になってしまう（CIRCLE/ARCがellipsePolyで対処しているのと
-        // 同じ問題）。局所座標系でセグメントごとに直線/円弧を密にサンプリング
-        // してから点ごとに変換することで対処する。
-        const segs = polySegments(localPts, localBulges, closed)
-        const worldPts: [number, number][] = []
-        for (const seg of segs) {
-          const arc = bulgeArc(seg.a, seg.b, seg.bulge)
-          if (!arc) {
-            worldPts.push(applyXform(x, seg.a))
-          } else {
-            const sampled = sampleArcLocalPoints(arc.c, arc.r, arc.startDeg, arc.sweepDeg)
-            for (const p of sampled.slice(0, -1)) worldPts.push(applyXform(x, p))
-          }
-        }
-        if (!closed) {
-          const last = segs[segs.length - 1]
-          worldPts.push(applyXform(x, last.b))
-        }
-        out.push({ type: 'polyline', pts: worldPts, bulges: worldPts.map(() => 0), closed })
-      } else {
-        const pts = localPts.map((p): [number, number] => applyXform(x, p))
-        // 鏡映(isMirrored)は局所座標系でのCCW/CWの意味を反転させるため、
-        // bulgeの符号も反転する必要がある（ARCエンティティの向き反転と同じ理由、
-        // 対処しないと鏡映ブロック内の丸め角が逆側に膨らむ）。
-        const flip = isMirrored(x)
-        const bulges = flip ? localBulges.map((b) => -b) : localBulges
-        out.push({ type: 'polyline', pts, bulges, closed })
+      out.push(polylineLoopToFlat(localPts, localBulges, closed, x))
+      return
+    }
+    case 'HATCH': {
+      // バグ修正: dxf-parser(v1.1.2)はHATCHを一切パースしない(entities配列に
+      // 現れない、ソース中にhatchの文字列自体が無い、実測で確認済み)。そのため
+      // parseHatchGroups()でparser.registerEntityHandlerを使い自前で生の
+      // group codeを収集し(loadDxf内で登録)、ここでその生データを解釈する。
+      // 塗り(パターン/ソリッド)は描画対象外、境界の輪郭線のみ描画する
+      // （実務図面のHATCHは断面表現等で頻出だが、本ビューアはOCCTを経由しない
+      // 純JS経路のため塗りつぶしパターン自体は非対応、README参照）。
+      const he = e as unknown as { rawGroups?: HatchRawGroups }
+      if (!he.rawGroups) return
+      const loops = parseHatchLoops(he.rawGroups)
+      for (const loop of loops) {
+        out.push(polylineLoopToFlat(loop.pts, loop.bulges, true, x))
       }
       return
     }
@@ -363,7 +395,178 @@ function flattenOne(e: IEntity, blocks: Record<string, IBlock>, layers: Record<s
       return
     }
     default:
-      return // 未対応エンティティ(TEXT/DIMENSION/HATCH等)は描画対象外
+      return // 未対応エンティティ(TEXT/DIMENSION等)は描画対象外
+  }
+}
+
+// --- HATCH境界パスの解析 ----------------------------------------------------
+// dxf-parserがHATCHを一切パースしないため、loadDxf()でregisterEntityHandlerに
+// より登録する自前ハンドラ(HatchRawHandler)がrawGroupsとして生のgroup code列を
+// 保持する。ここではその配列を単純な線形走査で解釈する（DxfArrayScannerの
+// next/rewind API経由の逐次パースだと「1つの疑似エンティティの境界をどこで
+// 区切るか」を状態機械で管理する必要があり誤りやすいため、まず生データを
+// フラットな配列として丸ごと保持してから、通常の配列インデックス操作で
+// 後処理する設計にした方が堅牢）。
+
+type HatchRawGroups = Array<[number, number | string | boolean]>
+
+interface HatchLoop {
+  pts: [number, number][]
+  bulges: number[]
+}
+
+function parseHatchLoops(groups: HatchRawGroups): HatchLoop[] {
+  const loops: HatchLoop[] = []
+  const n = groups.length
+  let i = 0
+  while (i < n && groups[i][0] !== 91) i++
+  if (i >= n) return loops
+  const numPaths = Number(groups[i][1])
+  i++
+  for (let p = 0; p < numPaths && i < n; p++) {
+    if (groups[i][0] !== 92) break
+    const flag = Number(groups[i][1])
+    i++
+    const isPolyline = (flag & 2) !== 0
+    if (isPolyline) {
+      let hasBulge = false
+      const pts: [number, number][] = []
+      const bulges: number[] = []
+      while (i < n && groups[i][0] !== 97) {
+        const code = groups[i][0]
+        if (code === 72) {
+          hasBulge = Number(groups[i][1]) !== 0
+          i++
+        } else if (code === 10) {
+          const px = Number(groups[i][1])
+          const py = Number(groups[i + 1]?.[1] ?? 0)
+          i += 2
+          let bulge = 0
+          if (hasBulge && groups[i]?.[0] === 42) {
+            bulge = Number(groups[i][1])
+            i++
+          }
+          pts.push([px, py])
+          bulges.push(bulge)
+        } else {
+          i++
+        }
+      }
+      if (i < n && groups[i][0] === 97) {
+        const numSrc = Number(groups[i][1])
+        i += 1 + numSrc
+      }
+      if (pts.length > 0) loops.push({ pts, bulges })
+    } else {
+      const pts: [number, number][] = []
+      const bulges: number[] = []
+      let unsupported = false
+      while (i < n && groups[i][0] !== 97) {
+        const code = groups[i][0]
+        if (code === 93) {
+          i++
+        } else if (code === 72) {
+          const edgeType = Number(groups[i][1])
+          i++
+          if (edgeType === 1) {
+            // line: 10,20(始点) 11,21(終点)
+            const ax = Number(groups[i]?.[1])
+            const ay = Number(groups[i + 1]?.[1])
+            const bx = Number(groups[i + 2]?.[1])
+            const by = Number(groups[i + 3]?.[1])
+            i += 4
+            pts.push([ax, ay])
+            bulges.push(0)
+            // 次エッジの始点と連結される想定なのでここではbの座標を保持せず、
+            // ループ末尾で最初の点に戻る前提（closed=true固定）にする代わりに、
+            // 直前エッジの終点=次エッジの始点が一致する前提で点列を1つずつ
+            // 積む(下記arcも同様)。最後のエッジの終点は closed=true なら
+            // 描画上不要（始点に戻るため)。
+            void bx
+            void by
+          } else if (edgeType === 2) {
+            // arc: 10,20(中心) 40(半径) 50,51(開始/終了角、度) 73(反時計回りフラグ)
+            const cx = Number(groups[i]?.[1])
+            const cy = Number(groups[i + 1]?.[1])
+            const r = Number(groups[i + 2]?.[1])
+            const f50 = Number(groups[i + 3]?.[1])
+            const f51 = Number(groups[i + 4]?.[1])
+            const ccw = Number(groups[i + 5]?.[1]) !== 0
+            i += 6
+            // 罠(実測で発覚、単純な角度反転や向き反転では説明が付かず、
+            // ezdxfドキュメント確認+隣接エッジとの連続性から逆算して特定):
+            // ccw=false(時計回り)の弧は、単にstart/endを入れ替えるのでも
+            // 単純に掃引方向を反転するだけでもなく、格納されているgroup 50/51の
+            // 角度そのものが「X軸に関する鏡映（符号反転）」を経た値になっている。
+            // 実データ(clockwise_arcs_hatch.dxf)で、隣接エッジ(連続性が既知の
+            // line/ccw=true arc)から実際に必要な開始角をatan2で逆算した結果、
+            // 360-f50・360-f51 (=角度を反転)がピタリ一致することを確認した上で
+            // 導出した式。ccw=trueの場合は素直にf50→f51へCCWに掃引するだけでよい。
+            let startDeg: number
+            let sweepDeg: number
+            if (ccw) {
+              startDeg = f50
+              sweepDeg = (((f51 - f50) % 360) + 360) % 360
+            } else {
+              startDeg = (((-f50) % 360) + 360) % 360
+              sweepDeg = -((((f51 - f50) % 360) + 360) % 360)
+            }
+            const startRad = (startDeg * Math.PI) / 180
+            const px = cx + r * Math.cos(startRad)
+            const py = cy + r * Math.sin(startRad)
+            const bulge = Math.tan(((sweepDeg * Math.PI) / 180) / 4)
+            pts.push([px, py])
+            bulges.push(bulge)
+          } else {
+            // 楕円弧(3)・スプライン(4)は未対応。可変長データで安全に読み飛ばす
+            // 手段が無いため、このHATCH全体を諦める(flattenEntitiesのtry/catch
+            // で当該エンティティだけスキップされ、他のエンティティには影響しない)。
+            unsupported = true
+            break
+          }
+        } else {
+          i++
+        }
+      }
+      if (unsupported) {
+        // このループの解析を中断したので後続位置が不定 → このHATCH全体を破棄
+        throw new Error('HATCH: 未対応の境界エッジ種別(楕円弧/スプライン)')
+      }
+      if (i < n && groups[i][0] === 97) {
+        const numSrc = Number(groups[i][1])
+        i += 1 + numSrc
+      }
+      if (pts.length > 0) loops.push({ pts, bulges })
+    }
+  }
+  return loops
+}
+
+/** dxf-parserのregisterEntityHandler用プラグイン。HATCHのgroup codeを解釈せず
+ * そのまま`rawGroups`に積むだけ（構造化はparseHatchLoopsで行う、上記コメント
+ * 参照）。layer/visibleだけは既存のflattenEntitiesのフィルタが使うため
+ * ついでに拾っておく。scanner/currの型はdxf-parserの内部型
+ * (DxfArrayScanner/IGroup)で、パッケージの公開エントリからは型がexportされて
+ * いないため`any`で受ける（生成されるオブジェクトの形はIGeometryとの構造的
+ * 互換性だけ満たせばよく、registerEntityHandlerの引数チェックは`any`同士の
+ * 構造的部分型として通る）。 */
+class HatchRawHandler {
+  ForEntityName = 'HATCH'
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  parseEntity(scanner: any, curr: any): any {
+    const entity: { type: string; layer?: string; visible?: boolean; rawGroups: HatchRawGroups } = {
+      type: curr.value,
+      rawGroups: [],
+    }
+    curr = scanner.next()
+    while (!scanner.isEOF()) {
+      if (curr.code === 0) break
+      if (curr.code === 8) entity.layer = curr.value
+      else if (curr.code === 60) entity.visible = curr.value === 0
+      entity.rawGroups.push([curr.code, curr.value])
+      curr = scanner.next()
+    }
+    return entity
   }
 }
 
@@ -635,6 +838,10 @@ export async function loadDxf(bytes: Uint8Array, filename: string): Promise<Mode
 
   const text = new TextDecoder('utf-8').decode(bytes)
   const parser = new DxfParser()
+  // HatchRawHandler登録: dxf-parserはHATCHを一切パースしないため、自前ハンドラを
+  // 差し込んで生group codeを拾う（詳細は上記HatchRawHandlerのコメント参照）。
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  ;(parser as unknown as { registerEntityHandler: (h: unknown) => void }).registerEntityHandler(HatchRawHandler)
   let dxf: IDxf | null
   try {
     dxf = parser.parseSync(text)
@@ -646,7 +853,7 @@ export async function loadDxf(bytes: Uint8Array, filename: string): Promise<Mode
   const flat: FlatEntity[] = []
   const layers = dxf.tables?.layer?.layers ?? {}
   flattenEntities(dxf.entities ?? [], dxf.blocks ?? {}, layers, IDENTITY, 0, flat)
-  if (flat.length === 0) throw new Error('図面に描画エンティティが無い（対応エンティティ: LINE/CIRCLE/ARC/LWPOLYLINE/POLYLINE/POINT/INSERT）')
+  if (flat.length === 0) throw new Error('図面に描画エンティティが無い（対応エンティティ: LINE/CIRCLE/ARC/LWPOLYLINE/POLYLINE/POINT/INSERT/HATCH(輪郭のみ)）')
 
   const bb = computeBbox(flat)
   if (!Number.isFinite(bb.min[0]) || !Number.isFinite(bb.max[0])) {
