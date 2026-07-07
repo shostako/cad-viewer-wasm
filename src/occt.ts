@@ -58,9 +58,33 @@ interface LoadedModel {
   triangleCount: number
   vertexCount: number
   meshPack: MeshPack // load時に構築してキャッシュ
+  // Codexレビュー指摘(P2、7巡目)を受けた恒久対策: このidを最後に「claim」した
+  // api.ts側の呼び出しのgen（api.tsの_uploadGen、uploadModel呼び出しごとに採番、
+  // フォーマット跨ぎで単調増加）。新規コミット時・cache-hit時の両方でこの値を
+  // max()更新することで、「誰が最後にこのidを見たか」を id 単位で追跡する。
+  // disposeByIdはこの値と呼び出し側の主張するgenが一致する時だけ実際に破棄する
+  // （＝自分より新しい誰かが既にこのidを見ていたら、たとえ自分がstaleでも
+  // 手を出さない）。詳細は disposeById のコメント参照。
+  claimGen: number
 }
 
 const _models = new Map<string, LoadedModel>()
+// Codexレビュー指摘(P2): loadModelは複数箇所でawaitするため、2つのアップロードが
+// 重なると後発(より小さい/速い)の読込が先に完了してUIの「現在のモデル」になった
+// 後、先発(遅い)の読込がその後で完了しevictOthers(id)を呼ぶと、UIが現在と
+// 思っているモデルまで_modelsから消してしまい、以降のfetchMesh/計測が
+// unknown model idで失敗する。世代カウンタで「自分の開始後により新しい読込が
+// 始まっていたら、evict/コミットを行わず自分のリソースだけ破棄する」よう
+// 直列化する。
+let _loadGen = 0
+
+// test-only: 次のloadModel呼び出しについて、gen採番の直後・重いパース処理の
+// 前に人為的な遅延を入れる。上記のレース（先発の遅い読込が後発より遅く
+// 完了する状況）を実ブラウザで決定的に再現するためのフック。
+let _stallNextLoadMs = 0
+export function __stallNextLoad(ms: number): void {
+  _stallNextLoadMs = ms
+}
 
 type Kind = 'step' | 'iges' | 'stl' | 'unsupported'
 
@@ -82,7 +106,15 @@ async function contentHash(bytes: Uint8Array): Promise<string> {
   return Array.from(arr, (b) => b.toString(16).padStart(2, '0')).join('')
 }
 
-function metaOf(model: LoadedModel): ModelMeta {
+// Codexレビュー指摘(P2、6巡目): api.ts側のdisposeById(stale-cleanup)は「このアップ
+// ロード呼び出しがloadModel内で新規にパース・コミットしたモデル」だけを対象に
+// すべきで、「たまたま同じcontentHashで既存の共有モデルを再利用しただけ」の
+// cache-hit応答を消してはいけない。例: 現在表示中のSTEPと同じファイルを
+// 再アップロードした呼びが、その最中に完了した別アップロードにsupersededされる
+// と、cache-hit分岐は現在表示中のモデルと同じidを返す。ここでdisposeByIdする
+// と表示中のモデルごと消えてしまう。呼び出し元がstale時に破棄して良いかを
+// 判断できるよう、cache-hitかどうかをmetaに載せて伝える。
+function metaOf(model: LoadedModel, cached = false): ModelMeta {
   return {
     id: model.id,
     name: model.name,
@@ -91,6 +123,7 @@ function metaOf(model: LoadedModel): ModelMeta {
     triangleCount: model.triangleCount,
     partCount: 1,
     bbox: model.bbox,
+    cached,
   }
 }
 
@@ -112,6 +145,40 @@ function evictOthers(keepId: string): void {
 export function disposeAll(): void {
   for (const m of _models.values()) disposeModel(m)
   _models.clear()
+}
+
+/**
+ * 特定のIDのモデルだけを破棄する。
+ *
+ * Codexレビュー指摘(P2): _loadGenは「同じOCCTローダー内」のレースしか見て
+ * いないため、STEP読込がinitOcct()/contentHash()でawait中に3MF/DXFへの
+ * 切替(api.ts側の_uploadGen)が発生してsupersededされても、他にOCCT読込が
+ * 無ければ「gen === _loadGen」が成立してしまい、そのSTEPモデルは普通に
+ * _modelsへコミットされてしまう。UIには一生表示されないのに、disposeAll()
+ * が呼ばれるまでWASMヒープに残り続ける。disposeAll()で一括破棄すると、
+ * その後に本当に始まった正当な新しいOCCT読込まで巻き込みかねないため、
+ * api.ts側が「このIDだけ」を指定して確実に破棄できる手段を用意する。
+ *
+ * Codexレビュー指摘(P2、7巡目、恒久対策): 上記のdisposeByIdは呼び出し元が
+ * stale判定した時点で無条件に(あるいはcache-hitかどうかだけで)破棄していたが、
+ * それでも「破棄しようとしているid」を、自分より新しい別の呼び出しが既に
+ * cache-hitで参照・依拠している可能性を見落とす（例: 同一ファイルへの
+ * ほぼ同時アップロードで、先発が新規コミット(cached:false)した直後に後発が
+ * cache-hitでそのidを引き継ぎ「現在」になったのに、先発が自分をstaleと気付き
+ * 無条件にdisposeByIdしてしまうと、後発が今まさに使っているモデルを消して
+ * しまう）。id単位で「最後にこのidを見た呼び出しのgen」(claimGen、api.ts
+ * 側の_uploadGenを渡してもらう)をLoadedModelに持たせ、disposeByIdは
+ * 「呼び出し時点でもclaimGenが自分のgenのままである(＝自分より新しい誰も
+ * このidに触れていない)」場合だけ実際に破棄する。呼び出し元は自分のgenを
+ * 渡すだけでよく、cache-hitかどうかを気にする必要が無くなる（安全性は
+ * このid単位のclaimGen比較だけで担保される）。
+ */
+export function disposeById(id: string, gen: number): void {
+  const m = _models.get(id)
+  if (!m) return
+  if (m.claimGen !== gen) return // 自分より新しい誰かが既にこのidを見ている
+  disposeModel(m)
+  _models.delete(id)
 }
 
 /**
@@ -223,8 +290,22 @@ function readStlShape(oc: OC, bytes: Uint8Array): OC {
   }
 }
 
-/** モデルファイルを読み、shape と面配列を格納して ModelMeta を返す。 */
-export async function loadModel(bytes: Uint8Array, name: string): Promise<ModelMeta> {
+/**
+ * モデルファイルを読み、shape と面配列を格納して ModelMeta を返す。
+ *
+ * @param apiGen api.ts側の_uploadGen（uploadModel呼び出しごとに採番、フォーマット
+ *   跨ぎで単調増加する値）。disposeByIdのid単位claimGen追跡に使うためだけの値で、
+ *   occt.ts自身の同一ローダー内レース制御（_loadGen、下記gen）とは独立。
+ *   呼び出し元(api.ts)は自分がstaleと分かった時、この同じ値をdisposeByIdへ
+ *   渡すことで「自分が最後にこのidを見た張本人の場合だけ」安全に破棄できる。
+ */
+export async function loadModel(bytes: Uint8Array, name: string, apiGen: number): Promise<ModelMeta> {
+  const gen = ++_loadGen
+  if (_stallNextLoadMs > 0) {
+    const ms = _stallNextLoadMs
+    _stallNextLoadMs = 0
+    await new Promise((r) => setTimeout(r, ms))
+  }
   const oc = await initOcct()
   const kind = classify(name)
   if (kind === 'unsupported') {
@@ -238,8 +319,16 @@ export async function loadModel(bytes: Uint8Array, name: string): Promise<ModelM
   // 同一内容が既にロード済みなら再パースせず再利用（backend のハッシュ dedup 相当）
   const cached = _models.get(id)
   if (cached) {
-    evictOthers(id)
-    return metaOf(cached)
+    // 自分の開始後により新しい読込が始まっていたら、evictを行わない
+    // （現在のモデルを巻き込んで消す事故を防ぐ）。
+    if (gen === _loadGen) evictOthers(id)
+    // claimGenは「このidを最後に見た呼び出し」を単調増加のapiGenで記録する。
+    // cache-hitの自分がstaleな古い呼び出しである可能性もあるため、
+    // 常に更新するのではなく「自分の方が新しい場合だけ」更新する
+    // （古いcache-hitが新しいclaimGenを巻き戻して壊すと、後から来る本当の
+    // 新しい呼び出しのdisposeById安全判定が誤って通ってしまう）。
+    if (apiGen > cached.claimGen) cached.claimGen = apiGen
+    return metaOf(cached, true)
   }
   // 注意: eviction は「新モデルのパース成功後」に行う（下部）。パース前に消すと、
   // 壊れた入力で読込失敗した際に表示中の旧モデルまで _models から消え、
@@ -325,16 +414,30 @@ export async function loadModel(bytes: Uint8Array, name: string): Promise<ModelM
     triangleCount: 0,
     vertexCount: 0,
     meshPack: undefined as unknown as MeshPack,
+    claimGen: apiGen,
   }
   // メッシュを即構築してキャッシュ（三角形/頂点数を meta に載せるため）。
   // エッジのサンプリング許容誤差(deflection)は面メッシュと同じ linDefl を使う
   // （Codexレビュー指摘: 固定値0.1だとメートル単位の小さい円弧・穴がほぼ潰れ、
   // 見た目上は曲線があるのにスナップ/計測できなくなるモデルスケール依存バグ）。
   model.meshPack = buildMeshPack(oc, model, linDefl)
-  _models.set(id, model)
-  // パース成功が確定してから旧モデルを破棄する（読込失敗時に表示中モデルを
-  // 巻き込まないため）。瞬間的に旧+新が同居するが、正しさをメモリ最小化より優先。
-  evictOthers(id)
+  // Codexレビュー指摘: 自分の開始後により新しい読込が既に完了していた場合、
+  // このモデルはUIに表示されることが無い（main.ts側のloadGenでも同じ理由で
+  // 無視される）。_modelsに残したままevictだけスキップすると、以降どこかの
+  // 読込がevictOthersするまで、表示されないshape/faces/meshPack(embind
+  // オブジェクト)がWASMヒープに残り続けてしまう（数百MBのOCCTヒープを
+  // 切り離す狙いと逆行する）。その場でdisposeして_modelsにも残さない
+  // （例外は投げない — main.tsのエラーハンドラはstale判定なしに表示中HUDを
+  // 上書きするため、ここで失敗させると現在正常に表示されているモデルの上に
+  // エラーメッセージが出てしまう）。
+  if (gen === _loadGen) {
+    _models.set(id, model)
+    // パース成功が確定してから旧モデルを破棄する（読込失敗時に表示中モデルを
+    // 巻き込まないため）。瞬間的に旧+新が同居するが、正しさをメモリ最小化より優先。
+    evictOthers(id)
+  } else {
+    disposeModel(model)
+  }
 
   return metaOf(model)
 }

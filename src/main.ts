@@ -10,6 +10,7 @@ import {
   putSidecar,
   __stallNextMeasure,
   __stallNextSidecar,
+  __stallNextLoad,
   type ModelMeta,
 } from './api'
 import { Drawing2D } from './drawing2d'
@@ -387,6 +388,13 @@ async function loadFile(file: File): Promise<void> {
       if (restoringOwner === gen) restoringOwner = 0
     }
   } catch (e) {
+    // Claude(GitHub Action)レビュー指摘: このcatchだけ他の全returnポイントと
+    // 違いstale判定(gen !== loadGen)が無かった。壊れたファイル・未対応形式
+    // 等で正当にthrowするケースで、先発(遅い)の読込が後発(速い、正常)の
+    // 読込にsupersededされた後にthrowすると、既に正しく表示されている
+    // 後発モデルのHUDをstaleなエラーメッセージで上書きしてしまう
+    // （3Dシーン自体は後発のままなので、表示とHUDが矛盾する）。
+    if (gen !== loadGen) return // stale failure — a newer load already won
     hudInfo.textContent = `エラー: ${e instanceof Error ? e.message : e}`
   }
 }
@@ -430,6 +438,7 @@ testHooks.__cadSet2DMeasureMode = (on: boolean) => {
 }
 testHooks.__cadStallMeasure = (ms: number) => __stallNextMeasure(ms)
 testHooks.__cadStallSidecar = (ms: number) => __stallNextSidecar(ms)
+testHooks.__cadStallLoad = (ms: number) => __stallNextLoad(ms)
 // spike検証用: 2つの面ID間の真値距離を直接測る（ピクセルピック非依存の計測実証）
 testHooks.__cadFaceDistance = async (idA: number, idB: number) => {
   if (!currentModelId) return null

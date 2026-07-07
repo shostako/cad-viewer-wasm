@@ -6,13 +6,25 @@
  * この api.ts だけが唯一の継ぎ目(seam)で、main/viewer/picking/measure は
  * データ源が Python サーバか WASM かを知らずに動く。
  *
+ * OCCT-WASM(occt.ts、数百MBのヒープを確保する)は Web Worker(occt.worker.ts)
+ * に隔離し、Comlink経由のRPCで呼ぶ（UIスレッドをブロックしないため）。
+ * 3MF(threemf.ts)・DXF(dxf.ts)は軽量な純JSなのでメインスレッドのまま。
+ *
  * サイドカー(計測の永続化)は localStorage に置く（backend もサーバも不要）。
  */
 import type { MeshPack } from './meshpack'
-import { loadModel, meshPackOf, distance, faceInfo, edgeInfo, disposeAll as disposeAllOcct } from './occt'
+import * as Comlink from 'comlink'
+import type { OcctWorkerApi } from './occt.worker'
 import { load3mf, meshPackOf3mf, disposeAll as disposeAllThreeMf } from './threemf'
 import { loadDxf, svgOf, disposeAll as disposeAllDxf } from './dxf'
 import { computeVertexThickness } from './thickness'
+
+// OCCT-WASM（数百MBのヒープを確保する重いエンジン）はUIスレッドをブロック
+// しないよう Web Worker に隔離する（README記載の設計目標）。3MF/DXFの
+// パーサは軽量な純JSなのでメインスレッドのまま（occt.worker.ts参照）。
+const occtWorker = Comlink.wrap<OcctWorkerApi>(
+  new Worker(new URL('./occt.worker.ts', import.meta.url), { type: 'module' }),
+)
 
 export interface ModelMeta {
   id: string
@@ -31,7 +43,43 @@ export async function fetchDrawingSvg(modelId: string): Promise<string> {
   return svgOf(modelId)
 }
 
+// test-only: 次のOCCT読込(occt.ts内のloadModel、gen採番の直後)だけ人為的に
+// 遅延させる。2つのアップロードが重なった時の世代ガード（occt.ts の
+// _loadGen）を決定的に再現するためのフック（既存の __stallNextMeasure と
+// 同じ流儀）。Worker側(occt.ts)のgen採番後に遅延させる必要があるため、
+// api.ts側でRPC呼び出し前に遅延させるのではなく、occtWorker自身に委譲する。
+export function __stallNextLoad(ms: number): Promise<void> {
+  return occtWorker.__stallNextLoad(ms)
+}
+
+// Codexレビュー指摘(P1×2): occt.ts内の_loadGenは「同じローダー内」のレース
+// (STEP同士等)しか見ておらず、フォーマットを跨いだ切替（3MF→STEP、STEP→3MF等）
+// のstale完了には無防備だった。例: 3MFアップロードが後発のSTEPアップロードに
+// supersededされても、staleな3MF側のuploadModelはload3mf完了後にレジューム
+// して occtWorker.disposeAll() を呼んでしまい、既に表示されている新しいSTEP
+// モデルをWorker側から消してしまう（逆方向＝staleなSTEPがdisposeAllThreeMf()
+// を呼んで現在の3MFを消すケースも同様）。main.tsのloadGenと同じ考え方で、
+// api.ts側にも独自の世代カウンタを持ち、「自分より新しいuploadModel呼び出しが
+// 始まっていたら、他フォーマットの破棄をスキップする」よう直列化する。
+let _uploadGen = 0
+
+// test-only: 次のuploadModel呼び出しについて、gen採番の直後・実際のパース
+// 処理の前に人為的な遅延を入れる。「先に始まった呼び出しが後発より遅く
+// 完了する」フォーマット跨ぎのレースを実ブラウザで決定的に再現するための
+// フック（occt.tsの__stallNextLoadと同じ流儀。delay採番の"後"に置くのが
+// 肝心 — 先に置くと遅延させた呼び出しが逆に"新しい"gen扱いになってしまう）。
+let _stallNextUploadMs = 0
+export function __stallNextUpload(ms: number): void {
+  _stallNextUploadMs = ms
+}
+
 export async function uploadModel(file: File): Promise<ModelMeta> {
+  const gen = ++_uploadGen
+  if (_stallNextUploadMs > 0) {
+    const ms = _stallNextUploadMs
+    _stallNextUploadMs = 0
+    await new Promise((r) => setTimeout(r, ms))
+  }
   const bytes = new Uint8Array(await file.arrayBuffer())
   const lower = file.name.toLowerCase()
   // 3MF/DXF は OCCT に読込手段が無い（3MF）か WASM化不可（DWG、DXFのみ純JSで
@@ -50,25 +98,58 @@ export async function uploadModel(file: File): Promise<ModelMeta> {
   }
   if (lower.endsWith('.dxf')) {
     const meta = await loadDxf(bytes, file.name)
-    disposeAllOcct()
-    disposeAllThreeMf()
+    if (gen === _uploadGen) {
+      // Codexレビュー指摘: occtWorker.disposeAll()をawaitすると、OCCT Workerが
+      // 大きいSTEP/STLの重い同期パース中はそのRPCがキューの後ろで詰まり、
+      // 既にパース完了しているDXF/3MFの表示までブロックされてしまう
+      // （Worker化でUIスレッドは守れても、Worker自体がビジーだと「切替」操作が
+      // 巻き込まれる）。破棄はメモリ解放のみが目的で戻り値のmetaに影響しない
+      // ため、待たずに投げっぱなしにする。
+      void occtWorker.disposeAll().catch(() => {})
+      disposeAllThreeMf()
+    }
     return meta
   }
   if (lower.endsWith('.3mf')) {
     const meta = await load3mf(bytes, file.name)
-    disposeAllOcct()
-    disposeAllDxf()
+    if (gen === _uploadGen) {
+      void occtWorker.disposeAll().catch(() => {})
+      disposeAllDxf()
+    }
     return meta
   }
-  const meta = await loadModel(bytes, file.name)
-  disposeAllThreeMf()
-  disposeAllDxf()
+  const meta = await occtWorker.loadModel(bytes, file.name, gen)
+  if (gen === _uploadGen) {
+    disposeAllThreeMf()
+    disposeAllDxf()
+  } else {
+    // Codexレビュー指摘: occt.ts内の_loadGenは「同じOCCTローダー内」のレース
+    // しか見ていない。このSTEP/IGES/STL読込がinitOcct()/contentHash()で
+    // await中に3MF/DXFへの切替(このgen !== _uploadGen)が発生してsuperseded
+    // されても、他にOCCT読込が無ければocct.ts側の「gen === _loadGen」は
+    // 成立してしまい、このモデルは普通に_modelsへコミットされてしまう。
+    // UIには一生表示されないのに、disposeAll()が呼ばれるまでWASMヒープに
+    // 残り続ける。disposeAll()は他の正当な現在モデルを巻き込む恐れがある
+    // ため使わず、このIDだけを指定して確実に破棄する。
+    //
+    // Codexレビュー指摘(6巡目→7巡目、P2×2、恒久対策): 「cache-hitかどうか」
+    // (meta.cached)だけで判定すると、同一ファイルのほぼ同時アップロードで
+    // 自分(先発)が新規コミット(cached:false)した直後に後発がcache-hitで
+    // 同じidを引き継いで「現在」になるケースを見落とす — 自分がstaleと
+    // 気付いた時にはもう後発が依拠しているので、無条件disposeByIdは危険。
+    // 逆に「cache-hitなら常にスキップ」も別の巻き込み事故を防げない。
+    // 安全性の判断はocct.ts側のid単位claimGen比較に一本化し、api.tsは
+    // 自分のgenを渡すだけにする（disposeByIdは「自分より新しい誰かが既に
+    // このidを見ていたら何もしない」ため、cached/fresh を問わず常に呼んで
+    // 安全 — occt.ts の disposeById 実装コメント参照）。
+    void occtWorker.disposeById(meta.id, gen).catch(() => {})
+  }
   return meta
 }
 
 export async function fetchMesh(modelId: string): Promise<MeshPack> {
   if (modelId.startsWith('t')) return meshPackOf3mf(modelId)
-  return meshPackOf(modelId)
+  return occtWorker.meshPackOf(modelId)
 }
 
 export interface EntityRef {
@@ -118,15 +199,15 @@ export async function measureDistance(modelId: string, a: EntityRef, b: EntityRe
     _stallNextMeasureMs = 0
     await new Promise((r) => setTimeout(r, ms))
   }
-  return distance(modelId, a, b)
+  return occtWorker.distance(modelId, a, b)
 }
 
 export function measureEdgeInfo(modelId: string, ref: EntityRef) {
-  return edgeInfo(modelId, ref)
+  return occtWorker.edgeInfo(modelId, ref)
 }
 
 export function measureFaceInfo(modelId: string, ref: EntityRef) {
-  return faceInfo(modelId, ref)
+  return occtWorker.faceInfo(modelId, ref)
 }
 
 /**
