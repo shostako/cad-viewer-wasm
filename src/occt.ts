@@ -6,18 +6,22 @@
  * B-rep（TopoDS_Face）に対して BRepExtrema / GProp で真値を出す。
  *
  * 対応形式:
- *   - STEP/IGES: STEPControl_Reader / IGESControl_Reader（非XCAF・単一シェイプ、面のみ）。
- *     どちらも XSControl_Reader 系の同一インターフェース
- *     （ReadFile → NbRootsForTransfer → TransferRoots → OneShape）を共有する。
+ *   - STEP: XCAF（STEPCAFControl_Reader）でアセンブリ・名前・形状を読む。読めなければ
+ *     （非XCAF STEPファイル、パース失敗等）STEPControl_Reader（単一シェイプ・面のみ）
+ *     にフォールバックする。どちらも1パート以上の `LoadedModel.parts` に正規化する。
+ *   - IGES: IGESControl_Reader（非XCAF・単一シェイプ、面のみ）。
  *   - STL: StlAPI_Reader。パラメトリック面を持たないため format は 'mesh' 扱いとし、
  *     本家 backend（trimesh 経由・B-rep計測なし）と挙動を揃えて計測を無効化する。
  *     3MF/OBJ/PLY は OCCT に読込手段が無く（本家も trimesh 任せで OCCT を通さない）、
  *     別途 JS 側パーサが必要 — 本ビルドは未対応。
  *
- * 未対応: アセンブリ展開・色・名前、エッジ/頂点スナップ、2D図面。
+ * XCAF（アセンブリ展開・名前・形状、対応済み）: 詳細は README「XCAF」節参照。
+ * 色は現状 XCAFDoc_ColorTool.GetColor が STEP 往復後のテスト実データで色を
+ * 検出できていない（原因未特定）ため、常に null（フォールバック表示色）。
+ * 未対応: エッジ/頂点スナップの一部形式、2D図面。
  * このビルドに TopTools_IndexedMapOfShape が無いため、面インデックスは
  * TopExp_Explorer の走査順で JS 側に自前保持する（テッセレーションと計測解決で
- * 同一配列を使うので faceId は一貫する）。
+ * 同一配列を使うので faceId はパート内で一貫する）。
  */
 // パッケージの index.js は `import wasm from './...wasm'` という bare import を持ち、
 // Vite の組み込み wasm ハンドラがそれを ESM 実体化しようとして import "a" 解決に失敗する。
@@ -46,14 +50,30 @@ export function initOcct(): Promise<OC> {
   return _initPromise as Promise<OC>
 }
 
+/** アセンブリツリーのノード（model.ts の TreeNodeData と同じ形。ここでは疎結合に自前定義）。 */
+interface TreeNode {
+  name: string
+  partId?: number
+  children?: TreeNode[]
+}
+
+/** 1パート＝1つの独立した形状（XCAFの部品、または非アセンブリ時は全体で1個）。 */
+interface ModelPart {
+  id: number
+  name: string
+  color: [number, number, number] | null
+  shape: OC // TopoDS_Shape（アセンブリ内の配置変換済み）
+  faces: OC[] // index i (0-based) => faceId i+1 の TopoDS_Face（パート内で一貫）
+  edges: OC[] // index i (0-based) => edgeId i+1 の TopoDS_Edge
+  vertices: OC[] // index i (0-based) => vertexId i+1 の TopoDS_Vertex
+}
+
 interface LoadedModel {
   id: string
   name: string
   format: 'brep' | 'mesh'
-  shape: OC // TopoDS_Shape
-  faces: OC[] // index i (0-based) => faceId i+1 の TopoDS_Face
-  edges: OC[] // index i (0-based) => edgeId i+1 の TopoDS_Edge
-  vertices: OC[] // index i (0-based) => vertexId i+1 の TopoDS_Vertex
+  parts: ModelPart[]
+  tree: TreeNode
   bbox: { min: number[]; max: number[] }
   triangleCount: number
   vertexCount: number
@@ -66,6 +86,10 @@ interface LoadedModel {
   // （＝自分より新しい誰かが既にこのidを見ていたら、たとえ自分がstaleでも
   // 手を出さない）。詳細は disposeById のコメント参照。
   claimGen: number
+  // XCAF(アセンブリ)経由で読んだ場合のみ設定。readXcafParts のコメント参照 —
+  // 抽出済みのパート形状がこのdocの内部データを参照しているため、モデルの
+  // 全パートを破棄し終えるまで生かしておく必要がある。
+  xcafDoc?: OC
 }
 
 const _models = new Map<string, LoadedModel>()
@@ -121,7 +145,7 @@ function metaOf(model: LoadedModel, cached = false): ModelMeta {
     format: model.format,
     vertexCount: model.vertexCount,
     triangleCount: model.triangleCount,
-    partCount: 1,
+    partCount: model.parts.length,
     bbox: model.bbox,
     cached,
   }
@@ -214,10 +238,15 @@ function del(...objs: Array<OC | null | undefined>): void {
 function disposeModel(m: LoadedModel): void {
   // embind オブジェクトは GC されない。明示 delete で WASM ヒープを返す。
   try {
-    m.shape?.delete?.()
-    for (const f of m.faces) f?.delete?.()
-    for (const e of m.edges) e?.delete?.()
-    for (const v of m.vertices) v?.delete?.()
+    for (const part of m.parts) {
+      part.shape?.delete?.()
+      for (const f of part.faces) f?.delete?.()
+      for (const e of part.edges) e?.delete?.()
+      for (const v of part.vertices) v?.delete?.()
+    }
+    // xcafDoc(TDocStd_Document)はパート形状が内部データを参照している
+    // （readXcafParts のコメント参照）ため、パート側を全て破棄した後に破棄する。
+    m.xcafDoc?.delete?.()
   } catch {
     /* 破棄失敗は致命ではない */
   }
@@ -290,6 +319,326 @@ function readStlShape(oc: OC, bytes: Uint8Array): OC {
   }
 }
 
+// ---------------------------------------------------------------- XCAF (アセンブリ)
+
+interface XcafPartShape {
+  name: string
+  shape: OC // 配置変換(TopLoc_Location)適用済みのTopoDS_Shape
+}
+
+interface XcafResult {
+  parts: XcafPartShape[]
+  tree: TreeNode
+  // 罠(実測でクラッシュ確認済み): 抽出したTopoDS_Shape(TNaming_NamedShape属性
+  // 経由で取得)は、XCAFの文書(TDocStd_Document)がラベル経由で内部所有する
+  // 形状データを共有・参照している。読込直後にdocをdeleteすると、Located()で
+  // 配置変換した「コピー」であっても元データが解放されヒープ破損する（3パート目
+  // 以降のBRepMesh_IncrementalMesh/TopExp_Explorerで不定挙動として顕在化する
+  // use-after-free、実ブラウザで`Invalid typed array length`のクラッシュとして
+  // 確認済み）。docはモデル全体（全パートのテッセレーション完了）と寿命を
+  // 共にする必要があるため、ここでは破棄せず呼び出し元へ持ち回す。
+  doc: OC
+}
+
+/**
+ * ラベルからName属性(TDataStd_Name)の文字列を読む。
+ *
+ * 罠(実測でクラッシュ確認済み): `TCollection_ExtendedString.Value(i)`（1文字ずつ
+ * 読み出す素朴な方法）はこのopencascade.jsビルドで文字列の中身に関わらず
+ * ネイティブクラッシュする（XCAF固有ではなく単独のExtendedStringでも再現。
+ * 原因未特定のバインディング不具合）。回避策: `new TCollection_AsciiString_13
+ * (extStr, defaultChar)` でAsciiStringへ変換してから`.Value(i)`を使う
+ * （AsciiStringは素のcharを保持するためこちらは安全に動く）。
+ *
+ * 罠(実測で確認・前回投稿の記録訂正): 以前の調査では「Handle_TDF_Attribute
+ * (汎用)からHandle_TDataStd_Name(具象型)への安全なダウンキャスト手段が
+ * 見つからない」としていたが、実際には`outAttr.get()`（Handle_TDF_Attribute
+ * に対する素の`.get()`）を呼ぶだけで正しい具象型（この場合TDataStd_Name）の
+ * インスタンスが返ってくる。embindの型解決がHandleの静的型ではなく実行時の
+ * 実体型を見ているためと推測される。`Handle_TDataStd_Name_2/3`コンストラクタ
+ * 経由の明示ダウンキャストは（型不一致で）機能しないが、そもそも不要だった。
+ */
+function readLabelName(oc: OC, label: OC): string | null {
+  const guid = oc.TDataStd_Name.GetID()
+  const outAttr = new oc.Handle_TDF_Attribute_1()
+  const found = label.FindAttribute_1(guid, outAttr)
+  if (!found) {
+    del(outAttr)
+    return null
+  }
+  const extStrVal = outAttr.get().Get()
+  const ascii = new oc.TCollection_AsciiString_13(extStrVal, 63) // 63='?'（非ASCII文字の置換用）
+  const len = ascii.Length()
+  let s = ''
+  for (let k = 1; k <= len; k++) s += String.fromCharCode(ascii.Value(k))
+  // Codexレビュー指摘: outAttr(Handle)とascii(このラベル専用に新規変換した
+  // 値、他パートと共有しない)は読み終えたら破棄する。outAttr.get()の戻り値
+  // (TDataStd_Nameインスタンス)自体は破棄しない — Handle破棄は.get()の戻り値に
+  // 影響しない、という既存の実測パターン（triHandle等）に倣う。
+  del(ascii, outAttr)
+  return s
+}
+
+/** ラベルのTNaming_NamedShape属性から形状を取り出す（無ければnull）。 */
+function shapeFromLabel(oc: OC, label: OC): OC | null {
+  const guid = oc.TNaming_NamedShape.GetID()
+  const outAttr = new oc.Handle_TDF_Attribute_1()
+  const found = label.FindAttribute_1(guid, outAttr)
+  if (!found) {
+    del(outAttr)
+    return null
+  }
+  // shapeは下地のTopoDS_TShapeを共有する永続データ（複数コンポーネントから
+  // 参照され得る）なのでここでは破棄しない。outAttr(Handle)だけ破棄する
+  // （Handle破棄は.get()の戻り値に影響しない、という既存の実測パターンに倣う）。
+  const shape = outAttr.get().Get()
+  del(outAttr)
+  return shape.IsNull() ? null : shape
+}
+
+/**
+ * ラベルの「タグパス」（例: "0:2:1"、Father()を辿ってTag()を連結）を安定な
+ * 識別子として返す。同一ドキュメント内で同じラベルを指す別々のJSラッパー
+ * オブジェクト（GetReferredShapeで都度new TDF_Label()して受けるため、同じ
+ * ラベルでもJS上の===比較は常にfalseになる）を、値で同一視するために使う。
+ * アセンブリのコンポーネントが同じ形状定義ラベルを複数回参照するケース
+ * （例: mini_mold.stepのcore_pinが2箇所に配置される）の重複メッシング検出に使う。
+ */
+function labelEntry(label: OC): string {
+  const tags: number[] = []
+  let cur = label
+  for (let i = 0; i < 64; i++) {
+    // 深さの上限は異常なラベルツリー（循環等）でのハング防止の安全弁
+    tags.unshift(cur.Tag())
+    const father = cur.Father()
+    if (father.IsNull()) break
+    cur = father
+  }
+  return tags.join(':')
+}
+
+/**
+ * STEPCAFControl_ReaderでXCAF(アセンブリ・名前・色)を読み、平坦化されたパート
+ * リスト＋ツリーを返す。非XCAFファイル・パース失敗・アセンブリ構造なしの場合は
+ * nullを返し、呼び出し元(loadModel)が非XCAFの単一シェイプ読込にフォールバックする。
+ *
+ * 実装は実ブラウザで1つずつ実測確認した手順のみで構成する（README「XCAF」節に
+ * 詳細）:
+ *   1. TDocStd_Document + STEPCAFControl_Reader.Transfer で文書を構築
+ *   2. shapeTool.BaseLabel().FindChild(i) でトップレベルの「自由な形状」を列挙
+ *      （TDF_LabelSequenceを要求するGetFreeShapes/GetComponentsは未バインドの
+ *      ため使わず、NbChildren/FindChildによる手動走査で代替する）
+ *   3. XCAFDoc_ShapeTool.IsAssembly(label)（静的メソッド）でアセンブリか判定し、
+ *      アセンブリなら子(コンポーネント参照)を再帰的に辿る。各コンポーネントは
+ *      XCAFDoc_ShapeTool.GetReferredShape(静的)で参照先の実体形状定義ラベルへ、
+ *      GetLocation(静的)で配置(TopLoc_Location)を得て、TopLoc_Location.Multiplied
+ *      で親からの累積変換と合成する（ネスト未検証だが標準的なOCCTの合成規則）
+ *   4. リーフ(非アセンブリ)ラベルはTNaming_NamedShape属性から形状を取り出し、
+ *      shape.Located(累積location)で配置変換を適用してパートとして確定する
+ */
+function readXcafParts(oc: OC, bytes: Uint8Array): XcafResult | null {
+  const path = '/xcaf.step'
+  let doc: OC | null = null
+  // 注意: 通常の del() ヘルパー経由の一括破棄はしない。成功時は doc を
+  // XcafResult 経由でモデルの寿命まで持ち回す必要がある（下記コメント参照）ため、
+  // 「何も返さず終わる」パス（!ok / nbFree<1 / parts.length===0 / 例外）でだけ
+  // 個別に破棄する。
+  try {
+    try {
+      oc.FS.unlink(path)
+    } catch {
+      /* 初回は存在しない */
+    }
+    oc.FS.writeFile(path, bytes)
+
+    const extStr = new oc.TCollection_ExtendedString_2('XmlXCAF', true)
+    doc = new oc.TDocStd_Document(extStr)
+    const hDoc = new oc.Handle_TDocStd_Document_2(doc)
+    const reader = new oc.STEPCAFControl_Reader_1()
+    reader.SetColorMode(true)
+    reader.SetNameMode(true)
+    let ok = false
+    try {
+      reader.ReadFile(path)
+      ok = reader.Transfer_1(hDoc)
+    } finally {
+      del(reader)
+      try {
+        oc.FS.unlink(path)
+      } catch {
+        /* ignore */
+      }
+    }
+    if (!ok) {
+      del(doc)
+      return null
+    }
+
+    const mainLabel = doc.Main()
+    const hShapeTool = oc.XCAFDoc_DocumentTool.ShapeTool(mainLabel)
+    const shapeTool = hShapeTool.get()
+    del(hShapeTool) // Handle破棄は.get()の戻り値(shapeTool)に影響しない（既存の実測パターンに倣う）
+    const baseLabel = shapeTool.BaseLabel()
+    const nbFree = baseLabel.NbChildren()
+    if (nbFree < 1) {
+      del(doc)
+      return null
+    }
+
+    // 罠(実測でハング確認済み・恒久対策): アセンブリのコンポーネントは同じ
+    // 形状定義ラベル（同一のTopoDS_TShape、実体データ）を複数回参照し得る
+    // （例: mini_mold.stepのcore_pinが2箇所に異なる配置で使われる）。walk()が
+    // その都度 shapeFromLabel() で取り出した形状に対して個別に
+    // BRepMesh_IncrementalMesh を実行すると、同一の下地形状データへ複数回
+    // メッシングをかけることになり、このWASMビルドでは2回目以降が完了せず
+    // ハングする（`Invalid typed array length`のクラッシュを経て特定。
+    // isInParallelフラグに関係無く再現するため並列化起因ではなく、同一
+    // TShapeへの重複メッシング自体が問題）。そのため、ここではまず全リーフの
+    // 「ラベル＋累積配置」だけを集め（メッシングは一切しない）、モデル全体の
+    // bboxからlinDeflを決めた後、重複するラベル（labelEntry()で同定）は
+    // 1回だけメッシングしてから、最後に配置変換済みの最終形状を組み立てる。
+    interface Leaf {
+      name: string
+      label: OC
+      loc: OC | null
+    }
+    const leaves: Leaf[] = []
+    let nextPartId = 0
+    // Codexレビュー指摘: walk()内で作るTDF_Label(outRef)・TopLoc_Location
+    // (compLoc、accLoc.Multiplied()の新規結果)は、末端のleafで
+    // 保持され続けたり(l.label/l.loc)、後段（bbox算出・重複排除メッシング・
+    // 最終パート組み立て）で使われ続けたりするため、walk()実行中には安全に
+    // 破棄できない。ここに集めておき、それら全ての用が済んだ後（parts組み立て
+    // 完了後）にまとめて破棄する。
+    const tempLabels: OC[] = []
+    const tempLocs: OC[] = []
+
+    // アセンブリでない単純な形状か判定するには、まずTNaming_NamedShapeが直接
+    // 付いているかを見る（付いていればリーフ）。IsAssembly静的判定と併用し、
+    // どちらでも「子を持たない」ケースを取りこぼさないよう両方確認する。
+    const walk = (label: OC, accLoc: OC | null): TreeNode | null => {
+      const isAssembly: boolean = oc.XCAFDoc_ShapeTool.IsAssembly(label)
+      const nbChildren: number = label.NbChildren()
+      if (!isAssembly || nbChildren === 0) {
+        // rawShapeはここでは存在確認だけに使う「リーフか否か」の判定用。
+        // 下地TopoDS_TShapeを共有する永続データ（tri等と同様）のため、
+        // 万一の共有破壊を避けてここでは破棄しない（bbox/mesh/parts組み立て
+        // の各パスでshapeFromLabelを呼び直し、都度フレッシュな参照を使う）。
+        const rawShape = shapeFromLabel(oc, label)
+        if (!rawShape) return null
+        const name = readLabelName(oc, label) ?? `part${nextPartId + 1}`
+        const partId = nextPartId++
+        leaves.push({ name, label, loc: accLoc })
+        return { name, partId }
+      }
+
+      const children: TreeNode[] = []
+      for (let i = 1; i <= nbChildren; i++) {
+        const compLabel = label.FindChild(i, false)
+        const outRef = new oc.TDF_Label()
+        const isRef: boolean = oc.XCAFDoc_ShapeTool.GetReferredShape(compLabel, outRef)
+        const targetLabel = isRef ? outRef : compLabel
+        tempLabels.push(outRef) // isRef===falseでも未使用のまま破棄対象に含めて良い
+        const compLoc = oc.XCAFDoc_ShapeTool.GetLocation(compLabel)
+        const combinedLoc = accLoc ? accLoc.Multiplied(compLoc) : compLoc
+        // accLocがある場合のみMultiplied()で新規オブジェクトが作られ、compLoc
+        // 自体はそれ以降不要になる（combinedLocとは別物）。accLocが無い場合は
+        // combinedLoc===compLocそのものなので、ここで破棄対象に入れない
+        // （Leafに保持され後段で使われるため）。
+        if (accLoc) tempLocs.push(compLoc)
+        const node = walk(targetLabel, combinedLoc)
+        if (node) children.push(node)
+      }
+      if (children.length === 0) return null
+      const name = readLabelName(oc, label) ?? 'assembly'
+      return { name, children }
+    }
+
+    // 罠(実測で確認): baseLabel(ShapesLabel)の子は「トップレベルの自由形状」
+    // （組立のルート等）と「他から参照されるだけの共有シェイプ定義」の両方が
+    // 並んで入っている。GetFreeShapes()相当の絞り込み無しに全子を歩くと、
+    // アセンブリのコンポーネントとして正しく配置済みのパートに加えて、
+    // 参照元シェイプ定義そのもの（原点に置かれたまま、コンポーネントの数だけ
+    // 重複）まで独立パートとして拾ってしまう（実機のmini_mold.stepで7パート
+    // に化けることを確認）。XCAFDoc_ShapeTool.IsFree(静的)で「他から参照
+    // されていない、真にトップレベルなラベル」だけに絞り込む
+    // （GetFreeShapes()自体はNCollection_Sequence<TDF_Label>を要求し未バインド
+    // だが、IsFreeは単一ラベルを取る静的メソッドでありバインドされている）。
+    const roots: TreeNode[] = []
+    for (let i = 1; i <= nbFree; i++) {
+      const freeLabel = baseLabel.FindChild(i, false)
+      if (!oc.XCAFDoc_ShapeTool.IsFree(freeLabel)) continue
+      const node = walk(freeLabel, null)
+      if (node) roots.push(node)
+    }
+    if (leaves.length === 0) {
+      del(doc)
+      return null
+    }
+
+    // 配置変換込みのbboxからlinDeflを決める（loadModel側の非XCAF経路と同じ
+    // 計算式）。メッシングより前に必要（メッシング精度の基準のため）だが、
+    // ここではまだ配置済みシェイプを保持していないので、bbox算出用に一時的に
+    // Located()するだけで済ませる（メッシュ済みでなくてもbboxは取れる）。
+    const placedForBbox = leaves.map((l) => {
+      const raw = shapeFromLabel(oc, l.label)
+      return l.loc ? raw.Located(l.loc) : raw
+    })
+    const bboxTmp = computeBBoxUnion(oc, placedForBbox)
+    const diagTmp = Math.hypot(
+      bboxTmp.max[0] - bboxTmp.min[0],
+      bboxTmp.max[1] - bboxTmp.min[1],
+      bboxTmp.max[2] - bboxTmp.min[2],
+    )
+    const linDefl = Math.max(diagTmp * 1e-3, 1e-6)
+    // bbox算出専用の使い捨てコピー。TopoDS_Shape系の破棄はFace/Edge/Vertex
+    // （disposeModelで日常的にまとめて破棄しており安全性が確認済み）と同じ
+    // カテゴリなので、ここで破棄して良い（Poly_Triangulationの明示delete
+    // だけが特別に危険 — 上記の罠コメント参照）。
+    for (const s of placedForBbox) del(s)
+
+    // ラベル単位で重複排除して1回だけメッシングする（同一形状定義を複数回
+    // 参照するコンポーネントがあっても、下地のTopoDS_TShapeは1回だけ処理する）。
+    const meshedEntries = new Set<string>()
+    for (const l of leaves) {
+      const entry = labelEntry(l.label)
+      if (meshedEntries.has(entry)) continue
+      meshedEntries.add(entry)
+      const raw = shapeFromLabel(oc, l.label)
+      if (!raw) continue
+      const mesher = new oc.BRepMesh_IncrementalMesh_2(raw, linDefl, false, 0.35, false)
+      del(mesher)
+    }
+
+    // メッシング済みの下地形状に、リーフごとの配置変換を適用して最終形状を組む。
+    const parts: XcafPartShape[] = leaves.map((l) => {
+      const raw = shapeFromLabel(oc, l.label)
+      const placed = l.loc ? raw.Located(l.loc) : raw
+      return { name: l.name, shape: placed }
+    })
+    // walk()内で作ったTDF_Label(outRef)・中間TopLoc_Location(compLoc)は、
+    // ここまでの全パス（bbox算出・重複排除メッシング・最終パート組み立て）で
+    // 使い終わったのでまとめて破棄する（Codexレビュー指摘への対応）。
+    // leaves自体が保持するlabel/loc（各パートの最終的な配置）はここでは
+    // 破棄しない — 破棄すると`Located()`で使い回すシェイプ自体は無事でも、
+    // 万一の再利用（例: エラー時の再試行系コード）に備えて安全側に倒す。
+    for (const t of tempLabels) del(t)
+    for (const t of tempLocs) del(t)
+
+    const tree: TreeNode = roots.length === 1 ? roots[0] : { name: 'model', children: roots }
+    // 成功: docは呼び出し元(loadModel)がモデルの寿命まで保持し、disposeModelで
+    // 他のパート形状と一緒に破棄する（早期に破棄すると抽出済みTopoDS_Shapeが
+    // 参照する内部データが解放されるため — 上記コメント参照）。
+    return { parts, tree, doc }
+  } catch (e) {
+    // XCAF読込はベストエフォート。失敗しても呼び出し元が非XCAF単一シェイプ
+    // 読込にフォールバックできるよう、例外を外へ投げずnullを返す。
+    console.warn('[occt] XCAF読込に失敗、非XCAF単一シェイプ読込にフォールバックします', e)
+    del(doc)
+    return null
+  }
+}
+
 /**
  * モデルファイルを読み、shape と面配列を格納して ModelMeta を返す。
  *
@@ -334,71 +683,100 @@ export async function loadModel(bytes: Uint8Array, name: string, apiGen: number)
   // 壊れた入力で読込失敗した際に表示中の旧モデルまで _models から消え、
   // 画面に残った旧ジオメトリへのピック/計測が unknown model id で死ぬ。
 
-  const shape =
-    kind === 'stl' ? readStlShape(oc, bytes) : readXsShape(oc, kind, bytes)
+  // STEPはまずXCAF(アセンブリ・名前)経由を試み、失敗したら非XCAFの単一シェイプ
+  // 読込にフォールバックする。IGES/STLは非XCAF単一シェイプのみ対応。
+  const xcaf = kind === 'step' ? readXcafParts(oc, bytes) : null
+  const rawParts: { name: string; shape: OC }[] = xcaf
+    ? xcaf.parts
+    : [{ name, shape: kind === 'stl' ? readStlShape(oc, bytes) : readXsShape(oc, kind, bytes) }]
+  const tree: TreeNode = xcaf ? xcaf.tree : { name, partId: 0 }
 
-  // テッセレーション（線形/角度たわみ）。
-  // 罠: StlAPI_Reader は「三角形1枚ごとに独立した平面 TopoDS_Face」を作るだけで、
-  // Poly_Triangulation は付与しない（テッセレーション済みではない）。STL でも
-  // IncrementalMesh を走らせないと BRep_Tool.Triangulation が null になり
-  // 面情報ゼロで描画が空になる。各面は元々平面なので、たわみを掛けても
-  // 三角形は増えず入力ジオメトリを素直に再現する。
-  const bbox = computeBBox(oc, shape)
+  // 全パート形状からモデル全体のbboxを算出（テッセレーション許容誤差の基準に使う）。
+  const bbox = computeBBoxUnion(oc, rawParts.map((p) => p.shape))
   const diag = Math.hypot(
     bbox.max[0] - bbox.min[0],
     bbox.max[1] - bbox.min[1],
     bbox.max[2] - bbox.min[2],
   )
   const linDefl = Math.max(diag * 1e-3, 1e-6)
-  const mesher = new oc.BRepMesh_IncrementalMesh_2(shape, linDefl, false, 0.35, true)
-  del(mesher) // アルゴリズムオブジェクト自体は shape へ書き込み済みで用済み（実測済み）
 
-  // 面を走査順に配列化（faceId = index+1）。
-  // 罠: exp.Current() の戻り値は delete 禁止（キャストした Face 側ごと壊れる。
-  // 実測でクラッシュ確認済み）。Explorer 自体はループを抜けたら delete して良い。
-  const faces: OC[] = []
-  const exp = new oc.TopExp_Explorer_2(
-    shape,
-    oc.TopAbs_ShapeEnum.TopAbs_FACE,
-    oc.TopAbs_ShapeEnum.TopAbs_SHAPE,
-  )
-  for (; exp.More(); exp.Next()) {
-    faces.push(oc.TopoDS.Face_1(exp.Current()))
-  }
-  del(exp)
+  const parts: ModelPart[] = rawParts.map((rp, idx) => {
+    // テッセレーション（線形/角度たわみ）。
+    // 罠: StlAPI_Reader は「三角形1枚ごとに独立した平面 TopoDS_Face」を作るだけで、
+    // Poly_Triangulation は付与しない（テッセレーション済みではない）。STL でも
+    // IncrementalMesh を走らせないと BRep_Tool.Triangulation が null になり
+    // 面情報ゼロで描画が空になる。各面は元々平面なので、たわみを掛けても
+    // 三角形は増えず入力ジオメトリを素直に再現する。
+    //
+    // XCAF経路はreadXcafParts内で既にラベル単位の重複排除付きメッシングを
+    // 済ませている（同一形状定義を複数コンポーネントが参照する場合、下地の
+    // TopoDS_TShapeへ複数回メッシングをかけるとこのWASMビルドではハングする
+    // ため — readXcafParts内のコメント参照）。ここで再度メッシングすると
+    // 同じ問題を再現してしまうため、XCAF経路では実行しない。
+    if (!xcaf) {
+      const mesher = new oc.BRepMesh_IncrementalMesh_2(rp.shape, linDefl, false, 0.35, false)
+      del(mesher) // アルゴリズムオブジェクト自体は shape へ書き込み済みで用済み（実測済み）
+    }
 
-  // エッジ/頂点も同じ手法で走査順に配列化（edgeId/vertexId = index+1）。
-  // ピック（picking.ts の snapVertex/snapEdge）と計測（resolveShape）が同じ
-  // 配列を参照するので ID の一貫性が保たれる。
-  //
-  // STL(kind==='stl')は対象外: StlAPI_Reader は三角形1枚ごとに独立した平面
-  // Face を作る設計（README既知の性能問題）で、580k三角形級のファイルだと
-  // 頂点・エッジ数がそのまま三角形数スケールになり実用にならない。STL は
-  // format='mesh' で真値計測自体が無効（backend の trimesh 経路と同じ扱い）
-  // なので、そもそもエッジ/頂点スナップの対象にする意味が無い。
-  const edges: OC[] = []
-  const vertices: OC[] = []
-  if (kind !== 'stl') {
-    const eexp = new oc.TopExp_Explorer_2(
-      shape,
-      oc.TopAbs_ShapeEnum.TopAbs_EDGE,
+    // 面を走査順に配列化（faceId = index+1、パート内で一貫）。
+    // 罠: exp.Current() の戻り値は delete 禁止（キャストした Face 側ごと壊れる。
+    // 実測でクラッシュ確認済み）。Explorer 自体はループを抜けたら delete して良い。
+    const faces: OC[] = []
+    const exp = new oc.TopExp_Explorer_2(
+      rp.shape,
+      oc.TopAbs_ShapeEnum.TopAbs_FACE,
       oc.TopAbs_ShapeEnum.TopAbs_SHAPE,
     )
-    for (; eexp.More(); eexp.Next()) {
-      edges.push(oc.TopoDS.Edge_1(eexp.Current()))
+    for (; exp.More(); exp.Next()) {
+      faces.push(oc.TopoDS.Face_1(exp.Current()))
     }
-    del(eexp)
+    del(exp)
 
-    const vexp = new oc.TopExp_Explorer_2(
-      shape,
-      oc.TopAbs_ShapeEnum.TopAbs_VERTEX,
-      oc.TopAbs_ShapeEnum.TopAbs_SHAPE,
-    )
-    for (; vexp.More(); vexp.Next()) {
-      vertices.push(oc.TopoDS.Vertex_1(vexp.Current()))
+    // エッジ/頂点も同じ手法で走査順に配列化。ピック（picking.ts の snapVertex/
+    // snapEdge）と計測（resolveShape）が同じ配列を参照するのでIDの一貫性が保たれる。
+    //
+    // STL(kind==='stl')は対象外: StlAPI_Reader は三角形1枚ごとに独立した平面
+    // Face を作る設計（README既知の性能問題）で、580k三角形級のファイルだと
+    // 頂点・エッジ数がそのまま三角形数スケールになり実用にならない。STL は
+    // format='mesh' で真値計測自体が無効（backend の trimesh 経路と同じ扱い）
+    // なので、そもそもエッジ/頂点スナップの対象にする意味が無い。
+    const edges: OC[] = []
+    const vertices: OC[] = []
+    if (kind !== 'stl') {
+      const eexp = new oc.TopExp_Explorer_2(
+        rp.shape,
+        oc.TopAbs_ShapeEnum.TopAbs_EDGE,
+        oc.TopAbs_ShapeEnum.TopAbs_SHAPE,
+      )
+      for (; eexp.More(); eexp.Next()) {
+        edges.push(oc.TopoDS.Edge_1(eexp.Current()))
+      }
+      del(eexp)
+
+      const vexp = new oc.TopExp_Explorer_2(
+        rp.shape,
+        oc.TopAbs_ShapeEnum.TopAbs_VERTEX,
+        oc.TopAbs_ShapeEnum.TopAbs_SHAPE,
+      )
+      for (; vexp.More(); vexp.Next()) {
+        vertices.push(oc.TopoDS.Vertex_1(vexp.Current()))
+      }
+      del(vexp)
     }
-    del(vexp)
-  }
+
+    return {
+      id: idx,
+      name: rp.name,
+      // XCAFDoc_ColorTool.GetColorが実データで色を検出できていない(README参照)ため
+      // 常にnull。フロントは色nullをデフォルト表示色として扱う（既存の3MF/STL経路
+      // と同じ契約）。
+      color: null,
+      shape: rp.shape,
+      faces,
+      edges,
+      vertices,
+    }
+  })
 
   const model: LoadedModel = {
     id,
@@ -406,15 +784,14 @@ export async function loadModel(bytes: Uint8Array, name: string, apiGen: number)
     // STL はパラメトリック面を持たず真値計測（BRepExtrema/GProp）が成立しないため、
     // 本家 backend の mesh 経路（trimesh・計測無効）と挙動を揃える。
     format: kind === 'stl' ? 'mesh' : 'brep',
-    shape,
-    faces,
-    edges,
-    vertices,
+    parts,
+    tree,
     bbox,
     triangleCount: 0,
     vertexCount: 0,
     meshPack: undefined as unknown as MeshPack,
     claimGen: apiGen,
+    xcafDoc: xcaf?.doc,
   }
   // メッシュを即構築してキャッシュ（三角形/頂点数を meta に載せるため）。
   // エッジのサンプリング許容誤差(deflection)は面メッシュと同じ linDefl を使う
@@ -442,10 +819,12 @@ export async function loadModel(bytes: Uint8Array, name: string, apiGen: number)
   return metaOf(model)
 }
 
-function computeBBox(oc: OC, shape: OC): { min: number[]; max: number[] } {
+function computeBBoxUnion(oc: OC, shapes: OC[]): { min: number[]; max: number[] } {
   const box = new oc.Bnd_Box_1()
   try {
-    oc.BRepBndLib.Add(shape, box, false)
+    for (const shape of shapes) {
+      oc.BRepBndLib.Add(shape, box, false)
+    }
     if (box.IsVoid()) return { min: [0, 0, 0], max: [0, 0, 0] }
     const lo = box.CornerMin()
     const hi = box.CornerMax()
@@ -467,13 +846,21 @@ export async function meshPackOf(id: string): Promise<MeshPack> {
 }
 
 /**
- * テッセレーション結果を MeshPack 形状のオブジェクトとして直接組む
- * （backend のバイナリ往復は不要。parseMeshPack と同じ {header, buffers}）。
- * 単一パート（id=0）。positions/normals は面ごとに頂点複製、indices は面ごと連続。
+ * 1パート分の面をテッセレーションし、頂点・法線・インデックス・faceRangesを返す。
  * 法線は三角形の巻き順から自前計算（このビルドに法線ヘルパーが無いため）。
- * shape は BRepMesh_IncrementalMesh 済みが前提（loadStep 内で実行済み）。
+ * shape は BRepMesh_IncrementalMesh 済みが前提（loadModel 内で実行済み）。
  */
-function buildMeshPack(oc: OC, model: LoadedModel, linDefl: number): MeshPack {
+function tessellatePartFaces(
+  oc: OC,
+  faces: OC[],
+): {
+  positions: Float32Array
+  normals: Float32Array
+  indices: Uint32Array
+  faceRanges: { faceId: number; triStart: number; triCount: number }[]
+  triCount: number
+  vertCount: number
+} {
   const positions: number[] = []
   const normals: number[] = []
   const indices: number[] = []
@@ -481,8 +868,8 @@ function buildMeshPack(oc: OC, model: LoadedModel, linDefl: number): MeshPack {
   let vertOffset = 0
   let triOffset = 0
 
-  for (let fi = 0; fi < model.faces.length; fi++) {
-    const face = model.faces[fi]
+  for (let fi = 0; fi < faces.length; fi++) {
+    const face = faces[fi]
     // Codexレビュー指摘(P1): 三角形分割(BRep_Tool.Triangulation)は面の下地
     // サーフェスに対して固定の巻き順で格納されており、TopAbs_REVERSED な面
     // （STEP/IGESのブーリアン演算後には普通に存在する）では実際の外向き法線が
@@ -501,7 +888,7 @@ function buildMeshPack(oc: OC, model: LoadedModel, linDefl: number): MeshPack {
     const nNodes: number = tri.NbNodes()
     const nTris: number = tri.NbTriangles()
     if (nTris === 0) {
-      del(tri, loc)
+      del(loc)
       continue
     }
 
@@ -572,54 +959,88 @@ function buildMeshPack(oc: OC, model: LoadedModel, linDefl: number): MeshPack {
     faceRanges.push({ faceId: fi + 1, triStart: triOffset, triCount: nTris })
     vertOffset += nNodes
     triOffset += nTris
-    del(tri)
+    // 罠(実測でヒープ破損を確認済み・恒久対策): 以前は del(tri) していたが、
+    // triはBRep_Tool.Triangulationが返すPoly_Triangulationの参照(triHandle.get())
+    // であり、下地のTopoDS_TShapeが所有する共有データを指している。単一シェイプ
+    // モデルでは各Faceが1回しか読まれないため実害が無かったが、XCAFアセンブリで
+    // 同じ形状定義を複数コンポーネントが参照するケース（例: mini_mold.stepの
+    // core_pinが2箇所に配置される）では、片方のパートの読込後にtriを明示delete
+    // すると、もう片方のパートが後で同じ面を読んだ時にはtriangulationデータが
+    // 既に破棄されており、NbNodes/NbTrianglesがゴミ値（巨大値・負値）を返す
+    // ヒープ破損として顕在化する（実測: 2個目のcore_pinでnNodesが負の巨大値に
+    // なりFloat32Arrayのlengthが不正になってクラッシュ）。tri自体は明示的に
+    // delete せず、Faceが破棄される際（disposeModelでのpart.faces破棄）に
+    // 任せる。
   }
 
-  model.triangleCount = triOffset
-  model.vertexCount = vertOffset
+  return {
+    positions: new Float32Array(positions),
+    normals: new Float32Array(normals),
+    indices: new Uint32Array(indices),
+    faceRanges,
+    triCount: triOffset,
+    vertCount: vertOffset,
+  }
+}
 
-  const posArr = new Float32Array(positions)
-  const nrmArr = new Float32Array(normals)
-  const idxArr = new Uint32Array(indices)
-  const { edgeArr, edgeRanges } = buildEdges(oc, model, linDefl)
-  const vertArr = buildVertices(oc, model)
+/**
+ * テッセレーション結果を MeshPack 形状のオブジェクトとして直接組む
+ * （backend のバイナリ往復は不要。parseMeshPack と同じ {header, buffers}）。
+ * パートごとに独立したバッファ（`p{id}:positions`等）を持つ（フロントの
+ * model.ts の toModelData が期待する契約）。
+ */
+function buildMeshPack(oc: OC, model: LoadedModel, linDefl: number): MeshPack {
+  const buffers: Record<string, Float32Array | Uint32Array> = {}
+  const headerBuffers: Record<string, ReturnType<typeof desc>> = {}
+  const partsHeader: {
+    id: number
+    name: string
+    color: [number, number, number] | null
+    faceRanges: { faceId: number; triStart: number; triCount: number }[]
+    edgeRanges: { edgeId: number; segStart: number; segCount: number }[]
+  }[] = []
+  let totalTri = 0
+  let totalVert = 0
+
+  for (const part of model.parts) {
+    const { positions, normals, indices, faceRanges, triCount, vertCount } = tessellatePartFaces(oc, part.faces)
+    const { edgeArr, edgeRanges } = buildEdges(oc, part.edges, linDefl)
+    const vertArr = buildVertices(oc, part.vertices)
+
+    buffers[`p${part.id}:positions`] = positions
+    buffers[`p${part.id}:normals`] = normals
+    buffers[`p${part.id}:indices`] = indices
+    buffers[`p${part.id}:edges`] = edgeArr
+    buffers[`p${part.id}:vertices`] = vertArr
+    headerBuffers[`p${part.id}:positions`] = desc('float32', positions.length)
+    headerBuffers[`p${part.id}:normals`] = desc('float32', normals.length)
+    headerBuffers[`p${part.id}:indices`] = desc('uint32', indices.length)
+    headerBuffers[`p${part.id}:edges`] = desc('float32', edgeArr.length)
+    headerBuffers[`p${part.id}:vertices`] = desc('float32', vertArr.length)
+
+    partsHeader.push({ id: part.id, name: part.name, color: part.color, faceRanges, edgeRanges })
+    totalTri += triCount
+    totalVert += vertCount
+  }
+
+  model.triangleCount = totalTri
+  model.vertexCount = totalVert
 
   // parseMeshPack が返すのと同じ形。BufferDesc の offset/byteLength は本経路では
   // 未使用（buffers を直接 typed array で持つ）だが型を満たすため埋める。
-  const buffers: Record<string, Float32Array | Uint32Array> = {
-    'p0:positions': posArr,
-    'p0:normals': nrmArr,
-    'p0:indices': idxArr,
-    'p0:edges': edgeArr,
-    'p0:vertices': vertArr,
-  }
   const header = {
-    buffers: {
-      'p0:positions': desc('float32', posArr.length),
-      'p0:normals': desc('float32', nrmArr.length),
-      'p0:indices': desc('uint32', idxArr.length),
-      'p0:edges': desc('float32', edgeArr.length),
-      'p0:vertices': desc('float32', vertArr.length),
-    },
-    parts: [
-      {
-        id: 0,
-        name: model.name,
-        color: null,
-        faceRanges,
-        edgeRanges,
-      },
-    ],
-    tree: { name: model.name, partId: 0 },
+    buffers: headerBuffers,
+    parts: partsHeader,
+    tree: model.tree,
   }
   return { header, buffers } as unknown as MeshPack
 }
 
 /** vertexId 順に B-rep 頂点の真値座標を書き出す（picking.ts の snapVertex が参照）。 */
-function buildVertices(oc: OC, model: LoadedModel): Float32Array {
-  const out = new Float32Array(model.vertices.length * 3)
-  for (let i = 0; i < model.vertices.length; i++) {
-    const p = oc.BRep_Tool.Pnt(model.vertices[i])
+function buildVertices(oc: OC, vertices: OC[]): Float32Array {
+  const out = new Float32Array(vertices.length * 3)
+  for (let i = 0; i < vertices.length; i++) {
+    const p = oc.BRep_Tool.Pnt(vertices[i])
     out[i * 3] = p.X()
     out[i * 3 + 1] = p.Y()
     out[i * 3 + 2] = p.Z()
@@ -654,15 +1075,15 @@ function buildVertices(oc: OC, model: LoadedModel): Float32Array {
  */
 function buildEdges(
   oc: OC,
-  model: LoadedModel,
+  edges: OC[],
   linDefl: number,
 ): { edgeArr: Float32Array; edgeRanges: { edgeId: number; segStart: number; segCount: number }[] } {
   const segs: number[] = []
   const edgeRanges: { edgeId: number; segStart: number; segCount: number }[] = []
   let segOffset = 0
 
-  for (let ei = 0; ei < model.edges.length; ei++) {
-    const edge = model.edges[ei]
+  for (let ei = 0; ei < edges.length; ei++) {
+    const edge = edges[ei]
     const curve = new oc.BRepAdaptor_Curve_2(edge)
     // 第3引数は Continuity()（曲線の連続性）。QuasiUniformDeflectionの3引数
     // オーバーロードはこの並びを要求する（実測済み）。
@@ -706,9 +1127,9 @@ function desc(dtype: 'float32' | 'uint32', count: number) {
 /**
  * 参照先の shape。owned=true は呼び出し側が使用後に del() する責務を持つ
  * 一時オブジェクト（point 参照で毎回新規に作る Vertex）。owned=false は
- * model.faces から借用した永続オブジェクトで、delete 禁止（今後の計測でも
- * 使い回すため）。この区別を怠ると point 参照が漏れ続けるか、face 参照を
- * 誤って破棄して以後の計測が壊れるかのどちらかになる。
+ * model.parts[].faces 等から借用した永続オブジェクトで、delete 禁止（今後の
+ * 計測でも使い回すため）。この区別を怠ると point 参照が漏れ続けるか、face
+ * 参照を誤って破棄して以後の計測が壊れるかのどちらかになる。
  */
 interface ResolvedShape {
   shape: OC
@@ -723,18 +1144,21 @@ function resolveShape(oc: OC, model: LoadedModel, ref: EntityRef): ResolvedShape
     del(pnt, maker) // Vertex()の戻り値とは独立（実測済み）
     return { shape: vertex, owned: true }
   }
+  const partId = ref.partId ?? 0
+  const part = model.parts[partId]
+  if (!part) throw new Error(`part id ${partId} out of range`)
   if (ref.kind === 'face' && ref.id) {
-    const f = model.faces[ref.id - 1]
+    const f = part.faces[ref.id - 1]
     if (!f) throw new Error(`face id ${ref.id} out of range`)
     return { shape: f, owned: false }
   }
   if (ref.kind === 'edge' && ref.id) {
-    const e = model.edges[ref.id - 1]
+    const e = part.edges[ref.id - 1]
     if (!e) throw new Error(`edge id ${ref.id} out of range`)
     return { shape: e, owned: false }
   }
   if (ref.kind === 'vertex' && ref.id) {
-    const v = model.vertices[ref.id - 1]
+    const v = part.vertices[ref.id - 1]
     if (!v) throw new Error(`vertex id ${ref.id} out of range`)
     return { shape: v, owned: false }
   }
@@ -815,7 +1239,7 @@ export async function faceInfo(id: string, ref: EntityRef): Promise<FaceInfoResu
     return out
   } finally {
     del(props, surf, face)
-    // face は resolved.shape (model.faces の永続 Face、または point参照の一時
+    // face は resolved.shape (part.faces の永続 Face、または point参照の一時
     // Vertex) を再キャストしたもの。再キャスト結果を破棄しても永続側は壊れない
     // ことを実測済み。owned な一時オブジェクトは resolved 側も破棄する。
     if (resolved.owned) del(resolved.shape)
@@ -872,7 +1296,7 @@ export async function edgeInfo(id: string, ref: EntityRef): Promise<EdgeInfoResu
     return out
   } finally {
     del(props, edge)
-    // edge は resolved.shape (model.edges の永続 Edge) を再キャストしたもの。
+    // edge は resolved.shape (part.edges の永続 Edge) を再キャストしたもの。
     // 再キャスト結果を破棄しても永続側は壊れない（faceInfo と同様に実測済みの
     // パターン）。owned な一時オブジェクトは resolved 側も破棄する。
     if (resolved.owned) del(resolved.shape)
