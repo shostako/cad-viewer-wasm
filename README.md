@@ -29,42 +29,97 @@ WASM かを知らずに動く。計測の永続化(サイドカー)は localStor
 BRepExtrema 真値距離** を確認済み（`spike_verify.py`、VERDICT: PASS、面間距離が
 箱の実寸法とピタリ一致）。
 
-対応形式: **STEP/IGES**（`occt.ts`、XSControl_Reader系・真値計測あり）、
-**STL**（`occt.ts`、StlAPI_Reader・format='mesh'で計測無効）、
-**3MF**（`threemf.ts`、OCCTを経由しない純JSのZIP+XMLメッシュ経路・format='mesh'）。
-いずれも実ブラウザで読込・描画・dedupを確認済み。
+対応形式: **STEP/IGES**（`occt.ts`、XSControl_Reader系・真値計測あり。STEPは
+XCAFアセンブリ展開対応）、**STL**（`occt.ts`、StlAPI_Reader・format='mesh'で
+計測無効）、**3MF**（`threemf.ts`、OCCTを経由しない純JSのZIP+XMLメッシュ経路・
+format='mesh'）。いずれも実ブラウザで読込・描画・dedupを確認済み。
 
 ### 未実装（本移植の残）
-- **アセンブリ展開・色・名前（XCAF）—調査の結果ブロック中**（詳細は下記）
 - カスタムビルドで wasm 63MB → 一桁 MB 台
+- XCAFの色（`XCAFDoc_ColorTool.GetColor`が実データで色を検出できていない、
+  詳細は下記）
 - （新規判明）StlAPI_Reader は三角形1枚ごとに独立 Face を作る設計のため、
   58万三角形級の大きい STL（`five_spoke_wheel.stl` 等）は実用にならない速度で
   固まる。Worker化はしたので少なくともUIは固まらないが、読込自体は依然重い。
-  アセンブリ対応と合わせて、大規模STLの扱い（レイヤ分割読込 or メッシュ経路
-  への切替）を別途検討する必要あり
+  大規模STLの扱い（レイヤ分割読込 or メッシュ経路への切替）を別途検討する必要あり
 
-### XCAF（アセンブリ展開・色・名前）調査メモ（2026-07-06）
+### XCAF（アセンブリ展開・名前・形状、対応済み）
 
-STEPCAFControl_Reader + TDocStd_Document(Handleラップ必須) での読込自体は成功し、
-TDF_Label のツリー構造（`NbChildren()`/`FindChild()`）も正しく取れる（実ファイルで
-子持ちラベル＝アセンブリ、子無し＝単純パーツという構造を確認済み）。
+STEPは`STEPCAFControl_Reader`でXCAF文書として読み、アセンブリ構造・名前・
+配置変換済みの形状を`LoadedModel.parts[]`（1パート＝1つの独立したTopoDS_Shape）
+として取り出す。失敗（非XCAF STEP、パース失敗、アセンブリ構造なし等）した場合は
+`STEPControl_Reader`による従来の単一シェイプ読込にフォールバックする。非XCAF
+STEP・IGES・STL・3MFはすべて「1パートのモデル」として同じ`parts[]`契約に
+正規化されるため、フロントエンド（`picking.ts`/`viewer.ts`/`measure.ts`/
+`tree.ts`、いずれも本家cad-viewerから無改造）は元々マルチパート前提の設計
+のまま、追加改修なしでXCAFアセンブリを描画・ピック・計測できた。
 
-**ブロッカー**: 以下2点が現行の `opencascade.js` 1.1.1（`builds/opencascade.full.yml`
-——公式提供される唯一かつ最も広いプリセット）で欠落している。
-1. `TDF_LabelSequence`（`NCollection_Sequence<TDF_Label>`）が未バインド。
-   `XCAFDoc_ShapeTool.GetFreeShapes()`/`GetComponents()` の標準入口が使えない
-2. `Handle_TDF_Attribute`（汎用）から `Handle_TDataStd_Name`/`Handle_TNaming_NamedShape`
-   （具象型）への安全なダウンキャスト手段が見つからない。属性の**存在確認**はできるが
-   **値の読み出し**ができない。`DownCast`探索中に1回ネイティブクラッシュを実測
-   （`Handle_X` コンストラクタへ汎用Handleを渡す組み合わせの一部が未定義動作）
+**2026-07-06時点の調査では「ブロック中」と判断していたが、実際には両ブロッカーとも
+回避できることが再調査で判明した**（別角度・実ブラウザでの1つずつの実測により）:
 
-バインディングは手動列挙でなく libclang による OCCT ヘッダの自動スキャン生成
-（`src/generateBindings.py` の `templateTypedefGenerator` 等）。`TDF_LabelSequence`
-の typedef 自体は OCCT 側に存在するため、理論上は自動検出されるはずだが、この
-ジェネレータのどこかで弾かれている（未特定）。カスタムビルドで直すには Docker
-（要起動）+ ジェネレータのソース調査 + 数時間のOCCTコンパイルが必要で、成功保証は
-無い。2026-07-06時点でユーザー判断により保留、優先度の低い項目として次回以降に
-再検討する。
+1. `XCAFDoc_ShapeTool.GetFreeShapes()`/`GetComponents()`が要求する
+   `NCollection_Sequence<TDF_Label>`（`TDF_LabelSequence`）は依然未バインドで
+   使えない。代わりに`shapeTool.BaseLabel()`から`NbChildren()`/`FindChild(i)`で
+   手動再帰走査し、`XCAFDoc_ShapeTool.IsFree`（静的、単一ラベルを取るので
+   バインドされている）で「他から参照されない真にトップレベルなラベル」だけに
+   絞り込むことで代替できる（絞り込み無しで全子を歩くと、アセンブリの
+   コンポーネントとして正しく配置済みのパートに加えて、参照元シェイプ定義
+   そのもの（未配置のまま）まで重複して拾ってしまう、実機で7パートに化ける
+   事故を実測）。
+2. `Handle_TDF_Attribute`（汎用）→`Handle_TDataStd_Name`/`Handle_TNaming_NamedShape`
+   （具象型）への安全なダウンキャストは、実は**`outAttr.get()`を呼ぶだけで
+   正しい具象型のインスタンスが返ってくる**（embindの型解決が実行時の実体型を
+   見ているためと推測、`Handle_TDataStd_Name_2/3`等の明示コンストラクタ経由の
+   ダウンキャストは型不一致で機能しないが、そもそも不要だった）。前回投稿時に
+   「ダウンキャスト探索中に1回クラッシュ」としていたのは、実際には別の操作
+   （下記3）が原因で、ダウンキャストそのものは無害と判明。
+3. 名前の文字列抽出で使っていた`TCollection_ExtendedString.Value(i)`
+   （1文字ずつ読む素朴な方法）がこのopencascade.jsビルドで**内容に関わらず
+   ネイティブクラッシュする**（XCAF固有ではなく単独のExtendedStringでも再現、
+   原因未特定のバインディング不具合）。回避策: `new TCollection_AsciiString_13
+   (extStr, defaultChar)`でAsciiStringへ変換してから`.Value(i)`を使う
+   （AsciiStringは素のcharを保持するため安全に動く）。
+
+**罠（実測でヒープ破損/ハングを確認済み・恒久対策）**: アセンブリのコンポーネントは
+同じ形状定義ラベル（同一のTopoDS_TShape）を複数回参照し得る（例:
+mini_mold.stepのcore_pinが2箇所に異なる配置で使われる）。
+1. 各コンポーネントの配置済み形状に対して個別に`BRepMesh_IncrementalMesh`を
+   実行すると、同一の下地形状データへ複数回メッシングをかけることになり、
+   2回目の呼び出しが完了せずハングする（`isInParallel`フラグの真偽に関係無く
+   再現、並列化起因ではなく重複メッシング自体が問題）。対策:
+   `labelEntry()`（ラベルのタグパスを文字列化した安定識別子）で重複排除し、
+   1つの形状定義につき1回だけメッシングしてから、パートごとに`Located()`で
+   配置変換を適用する。
+2. テッセレーション結果を読んだ後に`BRep_Tool.Triangulation`が返す
+   `Poly_Triangulation`（`tri`）を明示的に`delete`していたが、これは下地の
+   TopoDS_TShapeが所有する共有データであり、単一シェイプモデルでは各Faceが
+   1回しか読まれないため実害が無かった。XCAFアセンブリで同じ形状定義を複数
+   パートが参照する場合、片方のパートの読込後に`tri`を明示deleteすると、
+   もう片方のパートが後で同じ面を読んだ時には既にデータが破棄されており、
+   `NbNodes`/`NbTriangles`がゴミ値（巨大値・負値）を返すヒープ破損として
+   顕在化する（実測: 2個目のcore_pinで`nNodes`が負の巨大値になり
+   `Float32Array`のlengthが不正になってクラッシュ）。対策: `tri`は明示的に
+   delete しない（Faceが破棄される際のライフサイクルに委ねる）。
+3. 抽出した`TopoDS_Shape`（`TNaming_NamedShape`属性経由）は、XCAF文書
+   （`TDocStd_Document`）がラベル経由で内部所有する形状データを参照している。
+   読込直後に文書を`delete`すると、`Located()`で配置変換した「コピー」で
+   あっても元データが解放されヒープ破損する（3パート目以降で顕在化する
+   use-after-free）。文書はモデル全体（全パートの破棄）と寿命を共にする
+   必要があるため、`LoadedModel.xcafDoc`として持ち回し、`disposeModel`で
+   他のパート形状を破棄した後に破棄する。
+
+上記いずれも、実ブラウザで「STL読込→(同一ページで)mini_mold.step読込」
+という逐次シナリオで再現・修正確認済み（クラッシュ/ハングの再現条件が
+単発読込では現れず、複数モデルの読込を跨いだ場合にだけ顕在化した）。
+
+色（`XCAFDoc_ColorTool`）は`GetColor_1`〜`GetColor_8`が静的メソッドとして
+バインドされており、同じ「出力引数パターン」で取れる想定だったが、
+`ct.SetColor(label, color, XCAFDoc_ColorType.XCAFDoc_ColorSurf)`で色を
+設定したテストファイル（mini_mold.step）に対して`IsColor(label)`が`false`を
+返し、shape-definitionラベル・コンポーネントラベルのいずれでも色を検出
+できなかった（原因未特定 — STEP往復時の色の実際の格納場所が想定と異なる
+可能性がある）。現状は常に`color: null`（フロントのデフォルト表示色）で
+妥協しており、今後の調査課題として残す。
 
 ### embind オブジェクトの寿命管理（対応済み）
 
